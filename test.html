@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Embed Test</title>
+</head>
+<body>
+    <div id="chatbot-widget-container" class="hidden">
+  <div class="widget-header" id="widget-header">
+   
+  </div>
+  <iframe src="http://localhost:5000/embed/5?ownerId=1" width="100%" height="600px" frameborder="0"></iframe>
+</div>
+<div id="chatbot-toggle-button">&#x1F4AD;</div> <!-- Chat icon -->
+<style>
+  /* Basic styles for the widget */
+  #chatbot-widget-container {
+    position: fixed;
+    bottom: 100px;
+    right: 30px;
+    width: 350px;
+    height: 450px;
+    border-radius: 1rem;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+    overflow: hidden;
+    transition: all 0.3s ease-in-out;
+    transform-origin: bottom right;
+    z-index: 9999;
+    background-color: #ffffff;
+    display: flex; /* Use flex for column layout */
+    flex-direction: column;
+  }
+  #chatbot-widget-container.hidden {
+    transform: scale(0);
+    opacity: 0;
+    pointer-events: none;
+  }
+  #chatbot-widget-container.minimized {
+    height: 60px;
+    width: 250px;
+    border-radius: 1rem;
+    overflow: hidden;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  }
+  #chatbot-widget-container.maximized {
+    width: 90vw;
+    height: 90vh;
+    max-width: 800px;
+    max-height: 700px;
+    top: 5vh;
+    left: 5vw;
+    right: auto;
+    bottom: auto;
+    border-radius: 1rem;
+  }
+  
+  #chatbot-iframe {
+    flex-grow: 1; /* Allow iframe to take remaining space */
+    width: 100%;
+    height: 100%;
+    border: none;
+  }
+  #chatbot-toggle-button {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    background-color: #3b82f6;
+    color: white;
+    border-radius: 50%;
+    width: 60px;
+    height: 60px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    font-size: 24px;
+    cursor: pointer;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+    z-index: 10000;
+    transition: all 0.3s ease-in-out;
+  }
+  #chatbot-toggle-button:hover {
+    background-color: #2563eb;
+  }
+  .connection-status { /* Styles for connection status text */
+    padding: 0.25rem 0.5rem;
+    font-size: 0.65rem; /* Smaller font for status */
+    border-radius: 0.5rem;
+    margin-left: 0.5rem; /* Space from title */
+  }
+  .status-connected {
+    background-color: #d1fae5; /* Greenish */
+    color: #065f46;
+  }
+  .status-disconnected {
+    background-color: #fecaca; /* Reddish */
+    color: #991b1b;
+  }
+  .status-connecting {
+    background-color: #fef3c7; /* Yellowish */
+    color: #92400e;
+  }
+  /* Mobile Responsiveness */
+  @media (max-width: 768px) {
+    #chatbot-widget-container {
+      border-radius: 0;
+      box-shadow: none;
+      width: 100vw;
+      height: 100vh;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      transform: none;
+    }
+    #chatbot-widget-container.minimized {
+      width: 100%;
+      height: 60px;
+      bottom: 0;
+      right: 0;
+      left: 0;
+      top: auto;
+      border-radius: 0;
+    }
+    #chatbot-widget-container.hidden {
+      transform: translateX(100%);
+      opacity: 0;
+    }
+    #chatbot-toggle-button {
+      bottom: 10px;
+      right: 10px;
+      width: 50px;
+      height: 50px;
+      font-size: 20px;
+    }
+  }
+</style>
+<script>
+  document.addEventListener('DOMContentLoaded', function() {
+    const chatbotToggleButton = document.getElementById('chatbot-toggle-button');
+    const chatbotWidgetContainer = document.getElementById('chatbot-widget-container');
+    const widgetHeader = document.getElementById('widget-header');
+    const minimizeMaximizeButton = document.getElementById('minimize-maximize-button');
+    const chatbotIframe = document.getElementById('chatbot-iframe');
+    const widgetConnectionStatus = document.getElementById('widget-connection-status');
+
+    let isChatbotOpen = false;
+    let isChatbotMinimized = false;
+
+    function toggleChatbotVisibility() {
+      isChatbotOpen = !isChatbotOpen;
+      if (isChatbotOpen) {
+        chatbotWidgetContainer.classList.remove('hidden');
+        chatbotToggleButton.innerHTML = '&times;'; // 'x' icon
+      } else {
+        chatbotWidgetContainer.classList.add('hidden');
+        chatbotToggleButton.innerHTML = '&#x1F4AD;'; // Chat icon
+        if (isChatbotMinimized) {
+          toggleMinimizeMaximize(); // Reset to normal size if it was minimized
+        }
+      }
+    }
+
+    function toggleMinimizeMaximize() {
+      isChatbotMinimized = !isChatbotMinimized;
+      if (isChatbotMinimized) {
+        chatbotWidgetContainer.classList.add('minimized');
+        chatbotIframe.style.display = 'none'; // Hide the iframe content
+        minimizeMaximizeButton.innerHTML = '&#x25A1;'; // Square icon for maximize
+      } else {
+        chatbotWidgetContainer.classList.remove('minimized');
+        chatbotIframe.style.display = 'block'; // Show the iframe content
+        minimizeMaximizeButton.innerHTML = '&#x2212;'; // Minus icon for minimize
+      }
+    }
+
+    // Function to update status based on messages from iframe
+    window.addEventListener('message', function(event) {
+      // Ensure the message is from your iframe and has the expected structure
+      if (event.data && event.data.type === 'chatbotStatusUpdate') {
+        const status = event.data.status;
+        widgetConnectionStatus.className = 'connection-status ml-2'; // Reset classes
+        switch (status) {
+          case 'connected':
+            widgetConnectionStatus.classList.add('status-connected');
+            widgetConnectionStatus.textContent = 'Connected';
+            break;
+          case 'disconnected':
+            widgetConnectionStatus.classList.add('status-disconnected');
+            widgetConnectionStatus.textContent = 'Disconnected';
+            break;
+          case 'connecting':
+            widgetConnectionStatus.classList.add('status-connecting');
+            widgetConnectionStatus.textContent = 'Connecting...';
+            break;
+        }
+      }
+    });
+
+    chatbotToggleButton.addEventListener('click', toggleChatbotVisibility);
+    minimizeMaximizeButton.addEventListener('click', toggleMinimizeMaximize);
+    widgetHeader.addEventListener('dblclick', toggleMinimizeMaximize);
+  });
+</script>
+</body>
+</html>

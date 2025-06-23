@@ -1,0 +1,133 @@
+{
+  "processing_info": {
+    "inputs": [
+      "./uploads\\python_faqs.xlsx"
+    ],
+    "total_items_processed": 15,
+    "total_documents_embedded": 15,
+    "total_chunks_created": 15,
+    "js_rendering_used": true
+  },
+  "processed_items": [
+    {
+      "url": "file://P:\\xampp\\htdocs\\AI_chatbot_for_Cpanel\\backend\\uploads\\python_faqs.xlsx",
+      "title": "python_faqs.xlsx",
+      "source": ".xlsx",
+      "is_subpage": false,
+      "question": "What is Python?",
+      "answer": "Python is a high-level, interpreted programming language known for its readability and versatility."
+    },
+    {
+      "url": "file://P:\\xampp\\htdocs\\AI_chatbot_for_Cpanel\\backend\\uploads\\python_faqs.xlsx",
+      "title": "python_faqs.xlsx",
+      "source": ".xlsx",
+      "is_subpage": false,
+      "question": "What are Python's key features?",
+      "answer": "Key features include easy syntax, interpreted nature, dynamic typing, and a large standard library."
+    },
+    {
+      "url": "file://P:\\xampp\\htdocs\\AI_chatbot_for_Cpanel\\backend\\uploads\\python_faqs.xlsx",
+      "title": "python_faqs.xlsx",
+      "source": ".xlsx",
+      "is_subpage": false,
+      "question": "How is Python interpreted?",
+      "answer": "Python code is executed line-by-line by the Python interpreter."
+    },
+    {
+      "url": "file://P:\\xampp\\htdocs\\AI_chatbot_for_Cpanel\\backend\\uploads\\python_faqs.xlsx",
+      "title": "python_faqs.xlsx",
+      "source": ".xlsx",
+      "is_subpage": false,
+      "question": "What is a Python list?",
+      "answer": "A list is a collection which is ordered and mutable. It can contain mixed data types."
+    },
+    {
+      "url": "file://P:\\xampp\\htdocs\\AI_chatbot_for_Cpanel\\backend\\uploads\\python_faqs.xlsx",
+      "title": "python_faqs.xlsx",
+      "source": ".xlsx",
+      "is_subpage": false,
+      "question": "What is a dictionary in Python?",
+      "answer": "A dictionary is an unordered collection of key-value pairs."
+    },
+    {
+      "url": "file://P:\\xampp\\htdocs\\AI_chatbot_for_Cpanel\\backend\\uploads\\python_faqs.xlsx",
+      "title": "python_faqs.xlsx",
+      "source": ".xlsx",
+      "is_subpage": false,
+      "question": "How do you define a function in Python?",
+      "answer": "Use the 'def' keyword followed by the function name and parentheses to define a function."
+    },
+    {
+      "url": "file://P:\\xampp\\htdocs\\AI_chatbot_for_Cpanel\\backend\\uploads\\python_faqs.xlsx",
+      "title": "python_faqs.xlsx",
+      "source": ".xlsx",
+      "is_subpage": false,
+      "question": "What is the difference between a tuple and a list?",
+      "answer": "Lists are mutable, whereas tuples are immutable."
+    },
+    {
+      "url": "file://P:\\xampp\\htdocs\\AI_chatbot_for_Cpanel\\backend\\uploads\\python_faqs.xlsx",
+      "title": "python_faqs.xlsx",
+      "source": ".xlsx",
+      "is_subpage": false,
+      "question": "How do you handle exceptions in Python?",
+      "answer": "Use try-except blocks to handle exceptions."
+    },
+    {
+      "url": "file://P:\\xampp\\htdocs\\AI_chatbot_for_Cpanel\\backend\\uploads\\python_faqs.xlsx",
+      "title": "python_faqs.xlsx",
+      "source": ".xlsx",
+      "is_subpage": false,
+      "question": "What is a lambda function?",
+      "answer": "A lambda function is an anonymous function defined with the 'lambda' keyword."
+    },
+    {
+      "url": "file://P:\\xampp\\htdocs\\AI_chatbot_for_Cpanel\\backend\\uploads\\python_faqs.xlsx",
+      "title": "python_faqs.xlsx",
+      "source": ".xlsx",
+      "is_subpage": false,
+      "question": "How is memory managed in Python?",
+      "answer": "Python uses reference counting and garbage collection for memory management."
+    },
+    {
+      "url": "file://P:\\xampp\\htdocs\\AI_chatbot_for_Cpanel\\backend\\uploads\\python_faqs.xlsx",
+      "title": "python_faqs.xlsx",
+      "source": ".xlsx",
+      "is_subpage": false,
+      "question": "What are Python modules?",
+      "answer": "Modules are files containing Python code which can be imported and used in other scripts."
+    },
+    {
+      "url": "file://P:\\xampp\\htdocs\\AI_chatbot_for_Cpanel\\backend\\uploads\\python_faqs.xlsx",
+      "title": "python_faqs.xlsx",
+      "source": ".xlsx",
+      "is_subpage": false,
+      "question": "What is PEP8?",
+      "answer": "PEP8 is a style guide for Python code."
+    },
+    {
+      "url": "file://P:\\xampp\\htdocs\\AI_chatbot_for_Cpanel\\backend\\uploads\\python_faqs.xlsx",
+      "title": "python_faqs.xlsx",
+      "source": ".xlsx",
+      "is_subpage": false,
+      "question": "What is a virtual environment in Python?",
+      "answer": "A virtual environment is an isolated environment for Python projects to manage dependencies."
+    },
+    {
+      "url": "file://P:\\xampp\\htdocs\\AI_chatbot_for_Cpanel\\backend\\uploads\\python_faqs.xlsx",
+      "title": "python_faqs.xlsx",
+      "source": ".xlsx",
+      "is_subpage": false,
+      "question": "What is the use of 'self' in Python?",
+      "answer": "'self' refers to the instance of the class and is used in class methods."
+    },
+    {
+      "url": "file://P:\\xampp\\htdocs\\AI_chatbot_for_Cpanel\\backend\\uploads\\python_faqs.xlsx",
+      "title": "python_faqs.xlsx",
+      "source": ".xlsx",
+      "is_subpage": false,
+      "question": "What is the difference between deep copy and shallow copy?",
+      "answer": "Shallow copy copies references to objects, while deep copy copies the actual objects recursively."
+    }
+  ]
+}

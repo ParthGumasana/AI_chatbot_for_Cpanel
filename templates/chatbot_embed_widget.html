@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Chatbot Widget</title>
+    <!-- Tailwind CSS CDN for styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            margin: 0;
+            padding: 0;
+            overflow: hidden; /* Prevent body scroll */
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh; /* Ensure it takes full viewport height for centering */
+            background-color: #f0f2f5; /* Light background for the iframe */
+        }
+        .chat-container {
+            display: flex;
+            flex-direction: column;
+            height: 100vh; /* Full height of the iframe */
+            width: 100%;
+            max-width: 400px; /* Max width for wider screens */
+            background-color: #ffffff;
+            border-radius: 1rem; /* Rounded corners */
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); /* Subtle shadow */
+            overflow: hidden;
+        }
+        .chat-messages {
+            flex-grow: 1;
+            padding: 1rem;
+            overflow-y: auto; /* Enable scrolling for messages */
+            background-color: #f9fafb;
+        }
+        .message {
+            margin-bottom: 0.75rem;
+            line-height: 1.4;
+            max-width: 80%; /* Limit message width */
+            border-radius: 0.75rem; /* Rounded message bubbles */
+            padding: 0.5rem 0.75rem;
+            word-wrap: break-word; /* Ensure long words wrap */
+        }
+        .user-message {
+            background-color: #dbeafe; /* Light blue for user messages */
+            color: #1e40af;
+            align-self: flex-end; /* Align to the right */
+            margin-left: auto;
+        }
+        .bot-message {
+            background-color: #ecfdf5; /* Light green for bot messages */
+            color: #065f46;
+            align-self: flex-start; /* Align to the left */
+            margin-right: auto;
+        }
+        .chat-input-area {
+            display: flex;
+            padding: 1rem;
+            border-top: 1px solid #e5e7eb;
+            background-color: #ffffff;
+        }
+        .chat-input-area input, .chat-input-area textarea {
+            flex-grow: 1;
+            padding: 0.75rem 1rem;
+            border: 1px solid #d1d5db;
+            border-radius: 0.75rem;
+            margin-right: 0.75rem;
+            outline: none;
+            transition: border-color 0.2s ease-in-out;
+            resize: none; /* Disable textarea resize */
+        }
+        .chat-input-area input:focus, .chat-input-area textarea:focus {
+            border-color: #3b82f6; /* Blue border on focus */
+        }
+        .chat-input-area button {
+            background-color: #3b82f6; /* Blue button */
+            color: white;
+            padding: 0.75rem 1.25rem;
+            border-radius: 0.75rem;
+            cursor: pointer;
+            transition: background-color 0.2s ease-in-out;
+            font-weight: 600;
+        }
+        .chat-input-area button:hover {
+            background-color: #2563eb; /* Darker blue on hover */
+        }
+        .chat-input-area button:disabled {
+            background-color: #9ca3af;
+            cursor: not-allowed;
+        }
+        .connection-status {
+          
+            font-size: 0.75rem;
+            text-align: left;
+            border-radius: 0.5rem;
+            
+        }
+        .status-connected {
+            
+            color: #065f46;
+        }
+        .status-disconnected {
+           
+            color: #991b1b;
+        }
+        .status-connecting {
+            
+            color: #92400e;
+        }
+        .loading-indicator {
+            text-align: center;
+            padding: 0.5rem;
+            color: #6b7280;
+            font-size: 0.875rem;
+            display: none; /* Hidden by default */
+        }
+        .loading-indicator.active {
+            display: block;
+        }
+        .bot-status {
+            background-color: #fef3c7; /* Light yellow for status messages */
+            color: #92400e;
+            text-align: left;
+            font-size: 0.875rem;
+            border-radius: 0.5rem;
+            max-width: 90%;
+        }
+
+        /* Modal for Human Handoff */
+        .modal {
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.5);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        .modal-content {
+            background-color: #fefefe;
+            margin: auto;
+            padding: 20px;
+            border-radius: 0.75rem;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+            width: 90%;
+            max-width: 500px;
+        }
+        .modal-content input {
+            display: block;
+            width: 100%;
+            padding: 0.5rem;
+            margin-bottom: 1rem;
+            border: 1px solid #d1d5db;
+            border-radius: 0.5rem;
+        }
+        .modal-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 0.75rem;
+        }
+        /* Mobile Responsiveness */
+        @media (max-width: 768px) {
+            .chat-container {
+                border-radius: 0; /* No rounded corners on small screens for full coverage */
+                box-shadow: none;
+            }
+            body {
+                min-height: unset;
+            }
+        }
+    </style>
+    <!-- Socket.IO Client Library -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.0/socket.io.min.js"></script>
+</head>
+<body class="bg-gray-100 antialiased">
+    <div class="chat-container">
+        
+        <div style="padding-top: 5px; padding-bottom: 5px;" class="flex-none px-4 bg-blue-600 text-white text-lg font-semibold rounded-t-xl md:rounded-t-lg">
+            AI Assistant
+            <div id="connection-status" class="connection-status status-connecting">Connecting...</div>
+        </div>
+        <div class="chat-messages flex flex-col space-y-3" id="chat-messages">
+            <!-- Messages will be appended here -->
+            <div class="bot-message self-start">Hello! How can I assist you today?</div>
+        </div>
+        <div class="loading-indicator" id="loading-indicator">Typing...</div>
+        <div class="chat-input-area flex-none">
+            <input type="text" id="user-input" placeholder="Type your message..." class="rounded-lg" disabled>
+            <button id="send-button" class="rounded-lg" disabled>Send</button>
+        </div>
+    </div>
+
+    <!-- Human Handoff Modal -->
+    <div id="handoff-modal" class="modal hidden">
+        <div class="modal-content">
+            <h2 class="text-xl font-bold mb-4">Contact Human Agent</h2>
+            <p class="mb-4">Please provide your details so a human agent can contact you.</p>
+            <input type="text" id="handoff-name" placeholder="Your Name (Optional)">
+            <input type="email" id="handoff-email" placeholder="Your Email (Required)" required>
+            <input type="tel" id="handoff-phone" placeholder="Your Phone Number (Optional)">
+            <div class="modal-actions">
+                <button id="cancel-handoff" class="bg-gray-400 hover:bg-gray-500 text-white font-bold py-2 px-4 rounded">Cancel</button>
+                <button id="submit-handoff" class="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded">Submit Request</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const chatMessages = document.getElementById('chat-messages');
+        const userInput = document.getElementById('user-input');
+        const sendButton = document.getElementById('send-button');
+        const loadingIndicator = document.getElementById('loading-indicator');
+        const connectionStatus = document.getElementById('connection-status');
+        const handoffModal = document.getElementById('handoff-modal');
+        const submitHandoffButton = document.getElementById('submit-handoff');
+        const cancelHandoffButton = document.getElementById('cancel-handoff');
+        const handoffNameInput = document.getElementById('handoff-name');
+        const handoffEmailInput = document.getElementById('handoff-email');
+        const handoffPhoneInput = document.getElementById('handoff-phone');
+
+        // Dynamically injected by Flask (Jinja2) for backend communication
+        const CHATBOT_ID = "{{ chatbot_id }}";
+        const OWNER_USER_ID = "{{ owner_user_id }}"; // This is the user ID from your Laravel DB
+        const BACKEND_URL = "{{ backend_url }}";
+
+        let chatHistory = []; // Stores conversation history for the backend
+        let handoffSummary = ""; // Stores the summary for handoff
+        let socket = null;
+        let sessionId = null; // Unique session ID for this chat widget instance
+
+        // Initialize Socket.IO connection
+        function initializeSocket() {
+            socket = io(BACKEND_URL, {
+                transports: ['websocket', 'polling'], // Fallback to polling if websocket fails
+                timeout: 200000,
+                reconnection: true,
+                reconnectionDelay: 1000,
+                reconnectionAttempts: Infinity, // Changed to Infinity for persistent retries
+                reconnectionDelayMax: 5000, // Max delay for reconnection attempts
+                randomizationFactor: 0.5 // Add randomness to reconnection delay
+            });
+
+            // Generate unique session ID
+            sessionId = 'session_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+
+            // Connection events
+            socket.on('connect', () => {
+                console.log('Connected to backend Socket.IO server');
+                updateConnectionStatus('connected');
+                
+                // Join chatbot room and send initial connection data
+                socket.emit('join_chatbot_room', {
+                    chatbot_id: CHATBOT_ID,
+                    owner_user_id: OWNER_USER_ID,
+                    session_id: sessionId
+                });
+                
+                // Enable input after connection
+                userInput.disabled = false;
+                sendButton.disabled = false;
+                userInput.focus();
+            });
+
+            socket.on('disconnect', (reason) => {
+                console.log('Disconnected from backend:', reason);
+                updateConnectionStatus('disconnected');
+                userInput.disabled = true;
+                sendButton.disabled = true;
+                loadingIndicator.classList.remove('active');
+            });
+
+            socket.on('connect_error', (error) => {
+                console.error('Connection error:', error);
+                updateConnectionStatus('disconnected');
+                addMessage('Connection error. Please refresh the page to try again.', 'bot');
+                userInput.disabled = true;
+                sendButton.disabled = true;
+            });
+
+            socket.on('reconnect', (attemptNumber) => {
+                console.log('Reconnected after', attemptNumber, 'attempts');
+                updateConnectionStatus('connected');
+                addMessage('Connection restored!', 'bot');
+                userInput.disabled = false;
+                sendButton.disabled = false;
+                userInput.focus();
+            });
+
+            socket.on('reconnect_error', (error) => {
+                console.error('Reconnection failed:', error);
+                // No explicit message here as `connect_error` already handles general connection issues.
+            });
+
+            // Chat response events
+            socket.on('chat_response', (data) => {
+                console.log('Received chat response:', data);
+                loadingIndicator.classList.remove('active');
+                
+                // Add bot's message to chat history IF it's not a handoff prompt
+                if (!data.hand_off_required) {
+                    chatHistory.push({ role: "assistant", content: data.answer });
+                }
+
+                // Display bot's answer
+                addMessage(data.answer, 'bot');
+
+                // Handle special bot states
+                if (data.hand_off_required) {
+                    handoffSummary = data.summary_for_agent; // Store summary for handoff modal
+                    handoffModal.classList.remove('hidden'); // Show the modal
+                    userInput.disabled = true;
+                    sendButton.disabled = true;
+                }
+
+                if (data.turn_off_bot) {
+                    const turnOffMessageDiv = document.createElement('div');
+                    turnOffMessageDiv.classList.add('bot-status', 'bg-red-100', 'text-red-800');
+                    turnOffMessageDiv.innerHTML = "This conversation has ended. Please refresh the page to start a new chat.";
+                    chatMessages.appendChild(turnOffMessageDiv);
+                    userInput.disabled = true;
+                    sendButton.disabled = true;
+                }
+
+                // Re-enable input if not disabled by handoff or turn off
+                if (!data.hand_off_required && !data.turn_off_bot) {
+                    sendButton.disabled = false;
+                    userInput.focus();
+                }
+
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+            });
+
+            socket.on('chat_error', (data) => {
+                console.error('Chat error:', data);
+                loadingIndicator.classList.remove('active');
+                addMessage(`Oops! There was an error: ${data.error}. Please try again.`, 'bot');
+                sendButton.disabled = false; // Re-enable send button on error
+                userInput.focus();
+            });
+
+            socket.on('handoff_response', (data) => {
+                console.log('Handoff response:', data);
+                if (data.success) {
+                    addMessage("Your request has been submitted. A human agent will contact you shortly.", 'bot');
+                    handoffModal.classList.add('hidden');
+                    userInput.disabled = true;
+                    sendButton.disabled = true;
+                    chatHistory = []; // Clear chat history after handoff
+                } else {
+                    alert(`Failed to submit handoff request: ${data.error}. Please try again.`);
+                }
+            });
+
+            // Real-time notifications
+            socket.on('handoff_resolved_notification', (data) => {
+                console.log('Handoff resolved notification:', data);
+                addMessage("Good news! Your previous handoff request has been resolved. A human agent has looked into it.", 'bot');
+            });
+
+            socket.on('typing_indicator', (data) => {
+                if (data.typing) {
+                    loadingIndicator.classList.add('active');
+                } else {
+                    loadingIndicator.classList.remove('active');
+                }
+            });
+        }
+
+        function updateConnectionStatus(status) {
+            connectionStatus.className = 'connection-status';
+            switch (status) {
+                case 'connected':
+                    connectionStatus.classList.add('status-connected');
+                    connectionStatus.textContent = 'Connected';
+                    break;
+                case 'disconnected':
+                    connectionStatus.classList.add('status-disconnected');
+                    connectionStatus.textContent = 'Disconnected';
+                    break;
+                case 'connecting':
+                    connectionStatus.classList.add('status-connecting');
+                    connectionStatus.textContent = 'Connecting...';
+                    break;
+            }
+        }
+
+        function addMessage(text, sender) {
+            const messageDiv = document.createElement('div');
+            messageDiv.classList.add('message', sender === 'user' ? 'user-message' : 'bot-message');
+            messageDiv.innerHTML = text.replace(/\n/g, '<br>'); // Render newlines as breaks
+            chatMessages.appendChild(messageDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight; // Auto-scroll to bottom
+        }
+
+        function sendMessage() {
+            const query = userInput.value.trim();
+            if (!query || !socket || !socket.connected) return;
+
+            addMessage(query, 'user');
+            chatHistory.push({ role: "user", content: query });
+            userInput.value = '';
+            sendButton.disabled = true; // Disable button immediately
+            loadingIndicator.classList.add('active');
+
+            // Send message via Socket.IO
+            socket.emit('send_message', {
+                query: query,
+                // chat_history: chatHistory, // history is managed server-side
+                chatbot_id: CHATBOT_ID,
+                owner_user_id: OWNER_USER_ID,
+                session_id: sessionId
+            });
+        }
+
+        function submitHandoffRequest() {
+            const name = handoffNameInput.value.trim();
+            const email = handoffEmailInput.value.trim();
+            const phone = handoffPhoneInput.value.trim();
+
+            if (!email) {
+                alert("Please provide your email address.");
+                return;
+            }
+
+            if (!socket || !socket.connected) {
+                alert("Not connected to server. Please try again.");
+                return;
+            }
+
+            socket.emit('request_handoff', {
+                chatbot_id: CHATBOT_ID,
+                user_id: OWNER_USER_ID,
+                user_name: name,
+                user_email: email,
+                user_phone: phone,
+                query_history: chatHistory,
+                summary: handoffSummary,
+                session_id: sessionId
+            });
+        }
+
+        // Event listeners
+        sendButton.addEventListener('click', sendMessage);
+        userInput.addEventListener('keypress', (event) => {
+            if (event.key === 'Enter' && !sendButton.disabled) {
+                sendMessage();
+            }
+        });
+
+        submitHandoffButton.addEventListener('click', submitHandoffRequest);
+        cancelHandoffButton.addEventListener('click', () => {
+            handoffModal.classList.add('hidden');
+            if (socket && socket.connected) {
+                sendButton.disabled = false;
+                userInput.disabled = false;
+                userInput.focus();
+                addMessage("Handoff cancelled. How else can I help you?", 'bot');
+            }
+        });
+
+        // Initialize everything when page loads
+        window.addEventListener('load', () => {
+            console.log(`Initializing chatbot widget for Chatbot ID: ${CHATBOT_ID}, Owner User ID: ${OWNER_USER_ID}, Backend: ${BACKEND_URL}`);
+            initializeSocket();
+        });
+
+    </script>
+</body>
+</html>

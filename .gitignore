@@ -1,0 +1,5 @@
+/backend/venv
+/backend/__pycache__
+/venv
+/templates/__pycache__
+/templates/backup_code
