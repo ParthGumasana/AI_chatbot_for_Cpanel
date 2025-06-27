@@ -26,19 +26,38 @@ class AdminController extends Controller
     public function showHandoffs()
     {
         try {
-            $response = Http::withHeaders([
-                'X-Api-Key' => $this->flaskApiKey
-            ])->get("{$this->flaskBackendUrl}/admin/handoffs");
+            $user_id = Auth::id();
+            $is_admin = true; // Temporarily set to true for testing - change back to: Auth::user()->is_admin ?? false;
+            
+            // Determine which endpoint to use based on user role
+            if ($is_admin) {
+                // Admin sees all handoffs
+                $response = Http::withHeaders([
+                    'X-Api-Key' => $this->flaskApiKey
+                ])->get("{$this->flaskBackendUrl}/admin/handoffs");
+            } else {
+                // Regular user sees only their handoffs using the existing admin endpoint
+                // The backend will filter by user_id automatically
+                $response = Http::withHeaders([
+                    'X-Api-Key' => $this->flaskApiKey
+                ])->get("{$this->flaskBackendUrl}/admin/handoffs?user_id={$user_id}");
+            }
 
             if ($response->successful()) {
                 $handoffRequests = $response->json();
-                return view('admin.handoffs', compact('handoffRequests'));
+                
+                // Use different views based on user role
+                if ($is_admin) {
+                    return view('admin.handoffs', compact('handoffRequests', 'is_admin'));
+                } else {
+                    return view('admin.handoffs', compact('handoffRequests', 'is_admin')); // Use same view for now
+                }
             } else {
-                Log::error('Flask API Error (admin/handoffs): ' . $response->body());
+                Log::error('Flask API Error (handoffs): ' . $response->body());
                 return view('admin.handoffs')->withErrors(['api_error' => $response->json()['detail'] ?? 'Failed to load handoff requests.']);
             }
         } catch (\Exception $e) {
-            Log::error('Admin handoffs exception: ' . $e->getMessage());
+            Log::error('Handoffs exception: ' . $e->getMessage());
             return view('admin.handoffs')->withErrors(['error' => 'An unexpected error occurred: ' . $e->getMessage()]);
         }
     }

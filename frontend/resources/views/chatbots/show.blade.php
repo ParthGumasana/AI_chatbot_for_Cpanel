@@ -7,7 +7,6 @@
             <div class="p-6 bg-white border-b border-gray-200">
                 <h2 class="font-semibold text-xl text-gray-800 leading-tight mb-4">
                     Manage Chatbot: {{ $id }}
-                    
 
                     {{-- DELETE CHATBOT BUTTON --}}
                     <form action="{{ route('chatbots.destroy', $id) }}" method="POST" class="inline-block ml-4">

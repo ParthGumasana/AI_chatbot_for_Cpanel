@@ -7247,3 +7247,2492 @@ if __name__ == '__main__':
     startup_event()
     
     socketio.run(app, debug=True, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+perfect running code
+# backend/app.py Working code
+
+import traceback
+import eventlet
+eventlet.monkey_patch()
+from http.client import HTTPException
+from flask import Flask, request, jsonify, render_template, send_from_directory
+from flask_socketio import SocketIO, emit, join_room, leave_room
+import os
+import json
+import logging
+import asyncio
+import uuid
+import shutil
+from datetime import datetime, time, timedelta
+import time
+import sqlite3 # Still used for local accuracy logging
+from typing import Optional, List, Dict, Any
+from werkzeug.utils import secure_filename
+from functools import wraps
+from pydantic import BaseModel, Field, ValidationError
+import re
+import threading
+import httpx
+# MySQL Connector
+import mysql.connector
+from mysql.connector import Error as MySQL_Error
+from slugify import slugify
+from pathlib import Path
+# LangChain imports for RAG and LLM integration
+try:
+    from langchain_chroma import Chroma
+except ImportError:
+    from langchain_community.vectorstores import Chroma
+
+from langchain_community.embeddings import HuggingFaceEmbeddings
+
+# LLM Imports
+from langchain_openai import ChatOpenAI
+from openai import OpenAI
+from langchain_core.messages import AIMessage
+
+# For file processing (reusing logic from data_processor.py)
+from urllib.parse import urljoin, urlparse
+import requests
+from bs4 import BeautifulSoup
+import tldextract
+from robotexclusionrulesparser import RobotExclusionRulesParser
+from playwright.async_api import async_playwright
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
+try:
+    import openpyxl
+except ImportError:
+    openpyxl = None
+try:
+    from docx import Document as DocxDocument
+except ImportError:
+    DocxDocument = None
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
+
+# --- Configuration ---
+CHROMA_DB_BASE_PATH = "./chroma_dbs"
+UPLOAD_DIR = "./uploads"
+
+# MySQL Database Configuration
+MYSQL_HOST = os.environ.get('MYSQL_HOST', 'localhost')
+MYSQL_DATABASE = os.environ.get('MYSQL_DATABASE', 'chatbot_saas')
+MYSQL_USER = os.environ.get('MYSQL_USER', 'root')
+MYSQL_PASSWORD = os.environ.get('MYSQL_PASSWORD', '')
+
+# Backend API Key for Laravel to authenticate with Flask
+# IMPORTANT: Use a strong, secret key in production!
+FLASK_API_KEY = os.environ.get('FLASK_API_KEY', 'your_super_secret_flask_api_key')
+
+# LM Studio Configuration (for local testing LLM)
+LM_STUDIO_BASE_URL = os.environ.get('LM_STUDIO_BASE_URL', 'http://192.168.234.1:1234/v1')
+LM_STUDIO_MODEL_NAME = os.environ.get('LM_STUDIO_MODEL_NAME', 'gemm3:4b')
+
+VECTOR_STORE_PATH = "vector_stores"
+# Ensure directories exist
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(CHROMA_DB_BASE_PATH, exist_ok=True)
+
+
+# --- Flask App Initialization ---
+app = Flask(__name__, template_folder='../templates', static_folder='../static')
+print(f"Flask App template folder configured at: {os.path.abspath(app.template_folder)}")
+app.config['UPLOAD_FOLDER'] = UPLOAD_DIR
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024 # 16 MB max file upload size
+socketio = SocketIO(app, cors_allowed_origins="*") # Allow all origins for development, restrict in production
+
+# --- Configure logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- Global Variables for LLM and Embeddings ---
+embeddings = None
+llm_model= None
+active_sessions = {}  # Track active chat sessions
+handoff_requests = {}
+loaded_vectorstores: Dict[str, Chroma] = {} # {chatbot_id: Chroma instance}
+
+
+SENSITIVE_PATTERNS = {
+    "aadhar_number": r'\b\d{4}\s?\d{4}\s?\d{4}\b', # 12 digits, optional spaces, common for India
+    "mobile_number": r'\b\+?\d{1,4}[-.\s]?\(?\d{2,}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}\b', # General mobile number pattern
+    "email_address": r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}',
+    "pan_number": r'[A-Z]{5}[0-9]{4}[A-Z]{1}', # Indian PAN number format
+    "bank_account_no": r'\b\d{9,18}\b', # Common bank account number length (wide range)
+    "ifsc_code": r'[A-Z]{4}0[A-Z0-9]{6}' # Indian IFSC code format
+}
+
+def redact_sensitive_info(text: str) -> str:
+    """
+    Redacts sensitive information from the given text using predefined patterns.
+    """
+    if not isinstance(text, str):
+        return text # Only process strings
+    
+    redacted_text = text
+    for name, pattern in SENSITIVE_PATTERNS.items():
+        # Using a distinct placeholder for each type of sensitive info for clarity
+        redacted_text = re.sub(pattern, f"[{name.upper()}_REDACTED]", redacted_text, flags=re.IGNORECASE)
+    return redacted_text
+
+
+# --- Pydantic Models for Data Validation ---
+class UserProfile(BaseModel):
+    uid: str # Now this is a UUID generated by Laravel, not Firebase UID
+    email: str
+    created_at: datetime = Field(default_factory=datetime.now)
+
+class ChatRequestSchema(BaseModel):
+    query: str
+    # chat_history: List[Dict[str, str]] = []
+    chatbot_id: str
+    owner_user_id: str
+
+
+class HumanHandoffRequestSchema(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    chatbot_id: str
+    user_id: str # The ID of the user who owns the chatbot
+    user_name: Optional[str] = None
+    user_email: str
+    user_phone: Optional[str] = None
+    query_history: List[Dict[str, str]] # Stored as JSON string in DB
+    summary: Optional[str] = None
+    status: str = "pending"
+    created_at: datetime = Field(default_factory=datetime.now)
+    resolved_at: Optional[datetime] = None
+    agent_notes: Optional[str] = None
+    session_id: str
+
+class ChatbotConfigSchema(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: str # ID of the user who owns this chatbot (from MySQL users table)
+    name: str
+    description: Optional[str] = None
+    data_sources: List[str] = [] # Stored as JSON string in DB
+    llm_type: str = "LM_STUDIO"
+    openai_api_key: Optional[str] = None # Stored securely (consider encryption in production)
+    is_ready: bool = False
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: datetime = Field(default_factory=datetime.now)
+    embed_url: Optional[str] = None
+    status_message: Optional[str] = None # Added for more granular status updates
+
+
+# --- MySQL Database Connection ---
+def get_db_connection():
+    try:
+        conn = mysql.connector.connect(
+            host=MYSQL_HOST,
+            database=MYSQL_DATABASE,
+            user=MYSQL_USER,
+            password=MYSQL_PASSWORD
+        )
+        return conn
+    except MySQL_Error as e:
+        logger.error(f"Error connecting to MySQL Database: {e}")
+        raise RuntimeError(f"Could not connect to database: {e}")
+
+# --- API Key Authentication Decorator for Flask Backend ---
+def api_key_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        auth_header = request.headers.get('X-Api-Key') # Custom header for API key
+        if not auth_header or auth_header != FLASK_API_KEY:
+            logger.warning("API key required or invalid.")
+            return jsonify({"detail": "Unauthorized: Invalid or missing API Key"}), 401
+        return f(*args, **kwargs)
+    return decorated_function
+
+# --- Startup Event (for embeddings and sqlite DB) ---
+
+def startup_event():
+    global embeddings
+
+    print("Loading embedding model...")
+    try:
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            model_kwargs={'device': 'cpu'}
+        )
+        test_embed = embeddings.embed_query("test query")
+        print(f"Embedding model loaded successfully. Vector dimension: {len(test_embed)}")
+    except Exception as e:
+        print(f"Error loading embedding model: {e}")
+        raise RuntimeError("Failed to load embedding model.")
+
+    init_accuracy_db() # Initialize SQLite DB for local logging
+    print("Accuracy tracking database initialized.")
+    print("Chatbot backend startup complete.")
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        select_all_chatbots_query = "SELECT id, is_ready, data_sources, user_id FROM chatbots"
+        cursor.execute(select_all_chatbots_query)
+        chatbots_from_db = cursor.fetchall()
+        
+        for chatbot_data in chatbots_from_db:
+            chatbot_id = str(chatbot_data['id'])
+            db_is_ready = bool(chatbot_data['is_ready'])
+            data_sources = json.loads(chatbot_data['data_sources']) if chatbot_data['data_sources'] else []
+            owner_user_id = str(chatbot_data['user_id']) # Ensure user_id is string for consistency
+
+            client_chroma_path = os.path.join(CHROMA_DB_BASE_PATH, chatbot_id)
+            
+            # Scenario 1: DB says not ready, but ChromaDB exists (possible crash during processing)
+            if not db_is_ready and os.path.exists(client_chroma_path):
+                logger.info(f"Startup: Chatbot '{chatbot_id}' marked not ready in DB, but ChromaDB exists. Attempting to load and resync...")
+                try:
+                    # Attempt to load ChromaDB to verify its integrity
+                    temp_vectordb = Chroma(persist_directory=client_chroma_path, embedding_function=embeddings)
+                    # Perform a simple operation to check health
+                    _ = temp_vectordb.get(limit=1) 
+                    loaded_vectorstores[chatbot_id] = temp_vectordb # Add to cache
+                    
+                    update_query = "UPDATE chatbots SET is_ready = %s, updated_at = %s, status_message = %s WHERE id = %s"
+                    cursor.execute(update_query, (True, datetime.now(), 'Ready (resynced on startup)', chatbot_id))
+                    conn.commit()
+                    logger.info(f"Startup: Chatbot '{chatbot_id}' successfully resynced to 'Ready'.")
+                except Exception as e:
+                    logger.warning(f"Startup: Failed to load ChromaDB for chatbot '{chatbot_id}' during resync: {e}. Marking as not ready and will reprocess.", exc_info=True)
+                    update_query = "UPDATE chatbots SET is_ready = %s, updated_at = %s, status_message = %s WHERE id = %s"
+                    cursor.execute(update_query, (False, datetime.now(), 'Failed to load, reprocessing needed', chatbot_id))
+                    conn.commit()
+                    # Trigger reprocessing if there are data sources
+                    if data_sources:
+                        logger.info(f"Startup: Re-triggering data processing for chatbot '{chatbot_id}' due to load failure.")
+                        # Use eventlet.spawn to run the async function in a greenlet
+                        eventlet.spawn(process_chatbot_data, chatbot_id, owner_user_id, data_sources)
+            
+            # Scenario 2: DB says ready, but ChromaDB directory is missing
+            elif db_is_ready and not os.path.exists(client_chroma_path):
+                logger.warning(f"Startup: Chatbot '{chatbot_id}' marked ready in DB, but ChromaDB directory is missing on disk. Marking as not ready and re-triggering processing.")
+                update_query = "UPDATE chatbots SET is_ready = %s, updated_at = %s, status_message = %s WHERE id = %s"
+                cursor.execute(update_query, (False, datetime.now(), 'Knowledge base missing, reprocessing needed', chatbot_id))
+                conn.commit()
+                # Trigger reprocessing if there are data sources
+                if data_sources:
+                    logger.info(f"Startup: Re-triggering data processing for chatbot '{chatbot_id}' due to missing directory.")
+                    # Use eventlet.spawn to run the async function in a greenlet
+                    eventlet.spawn(process_chatbot_data, chatbot_id, owner_user_id, data_sources)
+            
+            # Scenario 3: DB says not ready, and no ChromaDB exists (normal state after creation/failure)
+            elif not db_is_ready and not os.path.exists(client_chroma_path):
+                if data_sources:
+                    logger.info(f"Startup: Chatbot '{chatbot_id}' is not ready and no ChromaDB found. Re-triggering processing if data sources exist.")
+                    # Use eventlet.spawn to run the async function in a greenlet
+                    eventlet.spawn(process_chatbot_data, chatbot_id, owner_user_id, data_sources)
+                else:
+                    logger.info(f"Startup: Chatbot '{chatbot_id}' is not ready and has no data sources. No processing needed.")
+
+
+    except MySQL_Error as e:
+        logger.error(f"Error during chatbot state check at startup: {e}", exc_info=True)
+    except Exception as e:
+        logger.error(f"Unexpected error during startup_event chatbot resync: {e}", exc_info=True)
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception as e:
+                logger.error(f"Error closing cursor in startup_event: {e}")
+        if conn and conn.is_connected():
+            try:
+                conn.close()
+            except Exception: # Removed 'e' since it might not be defined if no exception occurred
+                logger.error(f"Error closing connection in startup_event.")
+
+# --- LLM Loader Function ---
+def get_llm_instance(llm_type: str, openai_api_key: Optional[str] = None):
+    """Dynamically loads and returns the appropriate LLM instance."""
+    if llm_type == "LM_STUDIO":
+        logger.info(f"Initializig LM Studio LLM at {LM_STUDIO_BASE_URL} with model {LM_STUDIO_MODEL_NAME}...")
+        try:
+            return ChatOpenAI(
+                model_name=LM_STUDIO_MODEL_NAME,
+                base_url=LM_STUDIO_BASE_URL,
+                api_key="not-needed", # API Key is not needed for LM Studio local server
+                temperature=0.1
+            )
+        except Exception as e:
+            logger.error(f"Error initializing LM Studio LLM: {e}")
+            raise RuntimeError(f"Failed to initialize LM Studio LLM: {e}")
+    elif llm_type == "OPENAI":
+        if not openai_api_key:
+            raise ValueError("OpenAI API Key is required for OPENAI LLM type.")
+        logger.info("Initializing OpenAI LLM...")
+        try:
+            return ChatOpenAI(
+                model="gpt-3.5-turbo", # This can be configurable via chatbot settings
+                api_key=openai_api_key,
+                temperature=0.1
+            )
+        except Exception as e:
+            logger.error(f"Error initializing OpenAI LLM: {e}")
+            raise RuntimeError(f"Failed to initialize OpenAI LLM. Check API key: {e}")
+    else:
+        raise ValueError(f"Unsupported LLM type: {llm_type}")
+
+# --- Helper functions for data processing (from data_processor.py) ---
+def normalize_url(url):
+    parsed = urlparse(url)
+    normalized = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    if normalized.endswith('/') and len(parsed.path) > 1:
+        normalized = normalized.rstrip('/')
+    return normalized
+
+def is_internal_url(url, base_domain):
+    try:
+        extracted = tldextract.extract(url)
+        domain = f"{extracted.domain}.{extracted.suffix}"
+        return domain == base_domain
+    except:
+        return False
+
+EXCLUDE_PATTERNS = [
+    "/login", "/signup", "/register", "/cart", "/checkout", "/account",
+    "/terms", "/privacy", "/cookies", "/search", "/language", "/lang",
+    "?lang=", "?ref=", "?utm_", ".pdf", ".doc", ".jpg", ".png", ".svg",
+    "mailto:", "tel:", "/cookie-policy", "/terms-of-service", "/blog",
+    "forum", "/community", "/support", "/help"
+]
+
+LANGUAGE_CODES = ["en", "fr", "es", "de", "zh", "ja", "ru"]
+
+SUBPAGE_PATTERNS = [
+    r'/esim/[a-zA-Z\-\s]+$',
+    r'/country/[a-zA-Z\-\s]+$',
+    r'/region/[a-zA-Z\-\s]+$',
+]
+
+def is_excluded_url(url):
+    clean_url = url.split("#")[0].split("?")[0]
+    return any(pattern in clean_url for pattern in EXCLUDE_PATTERNS)
+
+def is_language_url(url):
+    path = urlparse(url).path
+    return any(lang in path.split('/') for lang in LANGUAGE_CODES)
+
+def is_target_subpage(url):
+    path = urlparse(url).path
+    return any(re.search(pattern, path) for pattern in SUBPAGE_PATTERNS)
+
+def extract_subpage_links(soup, base_url):
+    subpage_links = set()
+    for link in soup.find_all("a", href=True):
+        try:
+            href = link['href'].strip()
+            if not href or href.startswith('#'): continue
+            full_url = normalize_url(urljoin(base_url, href))
+            if is_target_subpage(full_url): subpage_links.add(full_url)
+        except Exception as e: print(f"Error processing link {link.get('href', '')}: {e}")
+    for script in soup.find_all("script"):
+        if script.string:
+            try:
+                matches = re.findall(r'["\']([^"\']*?/esim/[a-zA-Z\-\s]+)["\']', script.string)
+                for match in matches:
+                    full_url = normalize_url(urljoin(base_url, match))
+                    if is_target_subpage(full_url): subpage_links.add(full_url)
+            except Exception as e: print(f"Error processing script: {e}")
+    for element in soup.find_all(attrs={"data-href": True}):
+        try:
+            data_href = element.get("data-href", "").strip()
+            if data_href:
+                full_url = normalize_url(urljoin(base_url, data_href))
+                if is_target_subpage(full_url): subpage_links.add(full_url)
+        except Exception as e: print(f"Error processing data-href: {e}")
+    return subpage_links
+
+def get_robots_txt_parser(base_url):
+    try:
+        robots_url = urljoin(base_url, "/robots.txt")
+        response = requests.get(robots_url, timeout=5)
+        response.raise_for_status()
+        parser = RobotExclusionRulesParser()
+        parser.parse(response.text)
+        return parser
+    except requests.exceptions.RequestException as e:
+        print(f"Could not fetch robots.txt for {base_url}: {e}. Proceeding without robots.txt rules.")
+        return None
+    except Exception as e:
+        print(f"An unexpected error occurred while parsing robots.txt: {e}. Proceeding without robots.txt rules.")
+        return None
+
+
+async def fetch_page_content(page, url):
+    try:
+        await page.goto(url, timeout=60000)
+        
+        # Wait for key element to render before extracting
+        await page.wait_for_selector("body", timeout=10000)
+        await page.wait_for_timeout(3000)  # give time for any remaining JS content
+
+        html = await page.content()
+
+        # Save raw HTML for debugging
+        Path("html_debug").mkdir(exist_ok=True)
+        with open(f"html_debug/{slugify(url)}.html", "w", encoding="utf-8") as f:
+            f.write(html)
+
+        return html
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch {url}: {e}")
+        return ""
+
+
+def extract_page_data(soup, url):
+    title_tag = soup.find("title")
+    page_title = title_tag.get_text().strip() if title_tag else ""
+
+    meta_desc_tag = soup.find("meta", attrs={"name": "description"})
+    description = meta_desc_tag.get("content", "").strip() if meta_desc_tag else ""
+
+    # Remove unnecessary elements
+    for script_or_style in soup(["script", "style", "noscript"]):
+        script_or_style.extract()
+
+    # Fallback to full page body text
+    main_content_div = (
+        soup.find("main") or
+        soup.find("article") or
+        soup.find("body") or
+        soup.find(class_=re.compile(r"content|main-content|body|post"))
+    )
+
+    if main_content_div:
+        page_text = main_content_div.get_text(separator='\n', strip=True)
+    else:
+        page_text = soup.get_text(separator='\n', strip=True)
+
+    # Clean up excessive newlines
+    page_text = re.sub(r'\n\s*\n', '\n\n', page_text)
+
+    # Log extraction info
+    print(f"[DEBUG] {url} | Extracted length: {len(page_text.strip())}")
+    print(f"[DEBUG] Text preview: {page_text.strip()[:100]}")
+
+    return {
+        "url": url,
+        "title": page_title,
+        "description": description,
+        "text": page_text,
+        "is_subpage": is_target_subpage(url)
+    }
+
+
+def get_internal_links(soup, base_url, base_domain):
+    links = set()
+    for link in soup.find_all("a", href=True):
+        try:
+            href = link['href'].strip()
+            if not href or href.startswith('#') or href.startswith('mailto:') or href.startswith('tel:'): continue
+            full_url = normalize_url(urljoin(base_url, href))
+            if is_internal_url(full_url, base_domain) and not is_excluded_url(full_url) and not is_language_url(full_url): links.add(full_url)
+        except Exception as e: print(f"Error processing link: {e}")
+    return links
+
+async def run_website_scraper(start_url: str, max_pages_main_crawl: int = 500, max_subpages_crawl: int = 1000, use_js_render: bool = True):
+    _visited = set()
+    _output = []
+    _subpages_found = set()
+    parsed_start_url = urlparse(start_url)
+    if not parsed_start_url.scheme or not parsed_start_url.netloc: raise ValueError(f"Invalid START_URL '{start_url}'. Please provide a full URL (e.g., https://www.example.com).")
+    base_domain = tldextract.extract(start_url)
+    base_domain = f"{base_domain.domain}.{base_domain.suffix}"
+    robots_parser = get_robots_txt_parser(start_url)
+    print(f"Starting crawl of {start_url} (JS Render: {use_js_render})")
+    print(f"Base domain: {base_domain}")
+
+    page_obj = None
+    browser = None
+    p = None # Initialize playwright context manager
+
+    try:
+        if use_js_render:
+            p = await async_playwright().start()
+            browser = await p.chromium.launch(headless=True)
+            page_obj = await browser.new_page()
+            # Block unnecessary resources
+            await page_obj.route("**/*", lambda route, request: route.abort()
+                if request.resource_type in ["image", "stylesheet", "font"] else route.continue_())
+            page_obj.set_default_timeout(60000)
+            page_obj.set_default_navigation_timeout(60000)
+
+
+        async def _crawl_single_page(url, current_base_url, current_base_domain, current_robots, current_js_render, page_object_for_crawl, extract_subpages_from_this_page=True):
+            nonlocal _visited, _output, _subpages_found
+            url = normalize_url(url)
+            if url in _visited: return set()
+            if not is_internal_url(url, current_base_domain): return set()
+            if is_excluded_url(url): return set()
+            if is_language_url(url): return set()
+            if current_robots and not current_robots.is_allowed("*", url): print(f"Blocked by robots.txt: {url}"); return set()
+
+            if current_js_render:
+                html = await fetch_page_content(page_object_for_crawl, url)
+            else:
+                try:
+                    headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36' }
+                    resp = requests.get(url, timeout=15, headers=headers)
+                    resp.raise_for_status()
+                    if 'text/html' not in resp.headers.get("Content-Type", ""):
+                        html = None
+                    else:
+                        html = resp.text
+                except requests.exceptions.RequestException as e:
+                    print(f"Fetch failed for {url}: {e}")
+                    html = None
+                except Exception as e:
+                    print(f"An unexpected error occurred during fetch for {url}: {e}")
+                    html = None
+
+            if not html: return set()
+            _visited.add(url)
+            soup = BeautifulSoup(html, "html.parser")
+            found_subpages = set()
+            if extract_subpages_from_this_page:
+                found_subpages = extract_subpage_links(soup, current_base_url)
+                _subpages_found.update(found_subpages)
+            page_data = extract_page_data(soup, url)
+            page_data['text'] = page_data['text'][:10000]
+            _output.append(page_data)
+            print(f"Scraped: {url} (Title: '{page_data['title']}')")
+            return get_internal_links(soup, current_base_url, current_base_domain) # Changed this line to return internal links, not just subpages
+
+        to_crawl_queue = [normalize_url(start_url)]
+        crawled_main_pages_count = 0
+        print(f"Starting main breadth-first crawl (max {max_pages_main_crawl} pages)...")
+        while to_crawl_queue and crawled_main_pages_count < max_pages_main_crawl:
+            current_url = to_crawl_queue.pop(0)
+            if current_url in _visited: continue
+            
+            # This call will now correctly pass the page_obj
+            new_links = await _crawl_single_page(current_url, start_url, base_domain, robots_parser, use_js_render, page_obj, extract_subpages_from_this_page=True)
+            to_crawl_queue.extend(list(new_links - _visited)) # Add newly found links to queue, excluding already visited ones
+            crawled_main_pages_count += 1
+            
+            # The separate call for html_for_links is no longer needed here as _crawl_single_page handles fetching
+            # and returns new links.
+
+        print(f"Main crawl completed. Crawled {crawled_main_pages_count} pages.")
+        print(f"Found {_subpages_found} unique subpages. Starting dedicated crawl (max {max_subpages_crawl} subpages)...")
+
+        crawled_subpages_count = 0
+        subpage_crawl_queue = list(_subpages_found - _visited) # Start with found subpages that haven't been visited
+
+        while subpage_crawl_queue and crawled_subpages_count < max_subpages_crawl:
+            current_subpage_url = subpage_crawl_queue.pop(0)
+            if current_subpage_url in _visited: continue
+
+            # This call will also correctly pass the page_obj
+            await _crawl_single_page(current_subpage_url, start_url, base_domain, robots_parser, use_js_render, page_obj, extract_subpages_from_this_page=False) # No need to extract subpage links again
+            crawled_subpages_count += 1
+
+        print(f"Subpage crawl completed. Total unique pages scraped: {len(_output)}")
+
+    finally:
+        if browser:
+            await browser.close()
+        if p:
+            await p.stop()
+    return _output
+
+def _parse_structured_text(raw_text: str) -> List[Dict[str, str]]:
+    """
+    Heuristically parses raw text from PDF assuming a header row
+    and then records where values align to columns.
+    This is a simplification; for complex, varied PDFs, dedicated libraries are needed.
+    """
+    lines = raw_text.strip().split('\n')
+    if not lines:
+        return []
+
+    # Common headers to look for (can be expanded)
+    possible_headers = [
+        "Applicant Name", "Father or Husband Name", "District", "Current Address",
+        "Permanent Address", "Mobile", "Gender", "Date of Birth", "Age",
+        "Marital Status", "Caste", "SubCaste", "Loan Amount", "Business",
+        "Aadhar Number", "Pan Number", "Ration Number", "Bank Account no",
+        "IFSC Code", "Bank Name", "Branch Address", "Account Type",
+        "Gurantor Name", "Gurantor Mobile no",
+        "Gurantor Office Address", "Witness Name", "Witness Mobile no",
+        "Witness Aadhar no", "Witness Address", "Gurantor Home Address"
+    ]
+
+    header_line_index = -1
+    for i, line in enumerate(lines):
+        # Look for a line that contains several known headers (at least 3 to confirm it's a header row)
+        if sum(1 for header in possible_headers if header.lower() in line.lower()) >= 3:
+            header_line_index = i
+            break
+    
+    if header_line_index == -1:
+        logger.warning("No clear header line found in PDF text. Treating as unstructured.")
+        return [{"text_content": raw_text}] # Fallback to unstructured if no clear headers
+
+    header_line = lines[header_line_index]
+    data_lines = lines[header_line_index + 1:]
+
+    # A more robust way to get header names, handling variable spacing
+    # Find positions of headers by looking for 2 or more spaces as delimiters
+    header_splits = re.split(r'\s{2,}', header_line.strip())
+    headers = [h.strip() for h in header_splits if h.strip()]
+    
+    # Clean up headers for dictionary keys (snake_case, no special chars)
+    clean_headers = [re.sub(r'[^a-zA-Z0-9\s]', '', h).strip().replace(' ', '_').lower() for h in headers]
+    
+    if not clean_headers:
+        logger.warning("Failed to parse headers from PDF text. Treating as unstructured.")
+        return [{"text_content": raw_text}]
+
+    # Try to determine approximate column start positions based on header positions in the header line
+    header_start_positions = []
+    current_pos = 0
+    for header in headers:
+        idx = header_line.find(header, current_pos)
+        if idx != -1:
+            header_start_positions.append(idx)
+            current_pos = idx + len(header)
+        else:
+            # Fallback if a header isn't found, try to estimate a start position
+            header_start_positions.append(current_pos)
+            current_pos += len(header) + 5 # Arbitrary space
+
+    records = []
+    for line in data_lines:
+        if not line.strip():
+            continue
+        
+        record = {}
+        # Extract values based on estimated column start positions
+        for i, header_start in enumerate(header_start_positions):
+            if i < len(clean_headers):
+                value_end = len(line)
+                if i + 1 < len(header_start_positions):
+                    value_end = header_start_positions[i+1]
+                
+                value = line[header_start:value_end].strip()
+                record[clean_headers[i]] = value
+
+        # Final check for important numerical fields if not extracted by column
+        # This is a handled by general redaction now, but kept for parsing
+        if 'aadhar_number' not in record or not record['aadhar_number'].strip():
+            aadhar_match = re.search(r'\b\d{12}\b', line) # Common Aadhar format: 12 digits
+            if aadhar_match:
+                record['aadhar_number'] = aadhar_match.group(0)
+
+        if 'mobile' not in record or not record['mobile'].strip():
+            mobile_match = re.search(r'\b\d{10}\b', line) # Common Mobile format: 10 digits
+            if mobile_match:
+                record['mobile'] = mobile_match.group(0)
+
+        # Include all extracted text as a fallback if no specific fields are found
+        if not record:
+            record['text_content'] = line.strip()
+        
+        # Only add a record if it has some identifiable content
+        if any(record.values()):
+            records.append(record)
+    
+    return records
+
+
+# Modified extract_text_from_pdf to use _parse_structured_text
+def extract_text_from_pdf(file_path: str) -> List[Dict[str, str]]:
+    if PdfReader is None: raise ImportError("pypdf is not installed. Cannot process PDF files.")
+    raw_text = "";
+    try:
+        reader = PdfReader(file_path)
+        for page in reader.pages: raw_text += page.extract_text() + "\n"
+        print(f"Extracted raw text from PDF: {file_path}");
+        
+        # Now, parse this raw text for structured information
+        return _parse_structured_text(raw_text)
+    except Exception as e:
+        print(f"Error reading PDF {file_path}: {e}");
+        return [{"text_content": raw_text}] # Fallback to unstructured if error
+
+def extract_text_from_excel(file_path: str) -> List[Dict[str, str]]:
+    if openpyxl is None: raise ImportError("openpyxl is not installed. Cannot process Excel files.")
+    records = []
+    try:
+        workbook = openpyxl.load_workbook(file_path)
+        for sheet_name in workbook.sheetnames:
+            sheet = workbook[sheet_name]
+            
+            # Get headers from the first row
+            headers = [cell.value for cell in sheet[1]]
+            # Clean up headers for dictionary keys (snake_case, no special chars)
+            clean_headers = [
+                re.sub(r'[^a-zA-Z0-9\s]', '', str(h)).strip().replace(' ', '_').lower()
+                if h is not None else f"column_{i}"
+                for i, h in enumerate(headers)
+            ]
+            
+            for row_idx in range(2, sheet.max_row + 1): # Start from second row for data
+                record = {}
+                row_values = [cell.value for cell in sheet[row_idx]]
+                
+                for i, header in enumerate(clean_headers):
+                    if i < len(row_values):
+                        record[header] = str(row_values[i]) if row_values[i] is not None else ""
+                
+                if any(record.values()): # Only add if the row has some data
+                    records.append(record)
+        
+        print(f"Extracted structured data from Excel: {file_path}");
+        return records
+    except Exception as e:
+        print(f"Error reading Excel {file_path}: {e}");
+        return [] 
+
+def extract_text_from_docx(file_path: str) -> str:
+    if DocxDocument is None:
+        raise ImportError("python-docx is not installed. Cannot process DOCX files.")
+    full_text = []
+    try:
+        document = DocxDocument(file_path)
+        for para in document.paragraphs:
+            full_text.append(para.text)
+        return "\n".join(full_text)
+    except Exception as e:
+        print(f"Error reading DOCX {file_path}: {e}")
+        return ""
+
+async def process_single_input(input_path_or_url: str, use_js_render: bool) -> List[Dict[str, Any]]:
+    """
+    Processes a single input (URL or local file), extracts content, and returns structured data.
+    Sensitive information is redacted before the data is returned.
+    """
+    extracted_data_records = []
+    if input_path_or_url.startswith("http://") or input_path_or_url.startswith("https://"):
+        print(f"Processing URL: {input_path_or_url}")
+        try:
+            scraped_data = await run_website_scraper(
+                start_url=input_path_or_url,
+                max_pages_main_crawl=30, max_subpages_crawl=50, use_js_render=use_js_render
+            )
+            for page_data in scraped_data:
+                # Redact text content from scraped pages
+                redacted_page_text = redact_sensitive_info(page_data['text'])
+                extracted_data_records.append({
+                    "url": page_data['url'],
+                    "title": page_data['title'],
+                    "description": page_data['description'],
+                    "text_content": redacted_page_text,
+                    "is_subpage": page_data['is_subpage'],
+                    "file_type": "website_scrape"
+                })
+        except Exception as e:
+            logger.error(f"ERROR: Failed to scrape URL {input_path_or_url}: {e}", exc_info=True)
+    elif os.path.exists(input_path_or_url):
+        file_extension = os.path.splitext(input_path_or_url)[1].lower()
+        file_name = os.path.basename(input_path_or_url)
+        print(f"Processing file: {input_path_or_url} (Type: {file_extension})")
+        
+        file_content_records = []
+        if file_extension == ".pdf":
+            # PDF returns structured records; redact values within these records
+            raw_pdf_records = extract_text_from_pdf(input_path_or_url)
+            for record in raw_pdf_records:
+                redacted_record = {k: redact_sensitive_info(v) if isinstance(v, str) else v for k, v in record.items()}
+                file_content_records.append(redacted_record)
+        elif file_extension in [".xls", ".xlsx"]:
+            # Excel returns structured records; redact values within these records
+            raw_excel_records = extract_text_from_excel(input_path_or_url)
+            for record in raw_excel_records:
+                redacted_record = {k: redact_sensitive_info(v) if isinstance(v, str) else v for k, v in record.items()}
+                file_content_records.append(redacted_record)
+        elif file_extension in [".doc", ".docx"]:
+            raw_text = extract_text_from_docx(input_path_or_url)
+            if raw_text:
+                redacted_raw_text = redact_sensitive_info(raw_text)
+                file_content_records.append({"text_content": redacted_raw_text})
+        else:
+            logger.warning(f"Unsupported file type for {input_path_or_url}. Skipping."); return []
+
+        if file_content_records:
+            for record in file_content_records:
+                record_to_add = {
+                    "url": f"file://{os.path.abspath(input_path_or_url)}",
+                    "title": file_name,
+                    "source": file_extension,
+                    "is_subpage": False,
+                    **record
+                }
+                extracted_data_records.append(record_to_add)
+    else:
+        logger.error(f"ERROR: Input not found or invalid format: {input_path_or_url}. Skipping.")
+    return extracted_data_records
+
+async def process_chatbot_data(chatbot_id: str, user_id: str, data_sources: List[str]):
+    """
+    Background task to process data sources and build/update ChromaDB.
+    Now specifically handles structured data from files.
+    """
+    socketio.emit('processing_status', {'chatbot_id': chatbot_id, 'status': 'started', 'message': 'Starting data processing...'}, room=user_id)
+    
+    client_chroma_path = os.path.join(CHROMA_DB_BASE_PATH, chatbot_id)
+    
+    conn = None
+    cursor = None
+    
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Set chatbot to 'processing' state in DB immediately
+        update_query = "UPDATE chatbots SET is_ready = %s, updated_at = %s, status_message = %s WHERE id = %s"
+        cursor.execute(update_query, (False, datetime.now(), 'Processing data...', chatbot_id))
+        conn.commit()
+        logger.info(f"Chatbot '{chatbot_id}' status set to 'Processing' in DB.")
+
+        # Explicitly try to remove the old vector store from memory and force garbage collection
+        if chatbot_id in loaded_vectorstores:
+            try:
+                del loaded_vectorstores[chatbot_id]
+                logger.info(f"Removed ChromaDB instance for chatbot {chatbot_id} from cache.")
+                gc.collect() # Force garbage collection
+                time.sleep(10) # Increased delay to allow OS to release file handles
+            except Exception as e:
+                logger.warning(f"Failed to remove old ChromaDB instance from cache cleanly for {chatbot_id}: {e}")
+
+        if os.path.exists(client_chroma_path):
+            max_retries = 5 # Set max retries to 50 as seen in user's logs
+            for i in range(max_retries):
+                try:
+                    shutil.rmtree(client_chroma_path)
+                    logger.info(f"Existing ChromaDB directory {client_chroma_path} deleted successfully.")
+                    break # Exit loop if successful
+                except PermissionError as e:
+                    logger.warning(f"PermissionError deleting {client_chroma_path}. Retrying in 5 second... (Attempt {i+1}/{max_retries})")
+                    time.sleep(2) # Increased wait and retry
+                except Exception as e:
+                    logger.error(f"Error deleting existing ChromaDB directory {client_chroma_path}: {e}", exc_info=True)
+                    # If it's another type of error, no point in retrying. Re-raise or handle as a fatal error.
+                    raise
+            else: # This 'else' block executes if the loop completes without a 'break'
+                error_msg = 'Failed to clear old knowledge base due to file lock after multiple retries. Please restart backend if issue persists.'
+                logger.error(f"Failed to delete existing ChromaDB directory {client_chroma_path} after {max_retries} retries due to PermissionError. Cannot proceed.")
+                socketio.emit('processing_status', {'chatbot_id': chatbot_id, 'status': 'failed', 'message': error_msg}, room=user_id)
+                
+                update_query = "UPDATE chatbots SET is_ready = %s, updated_at = %s, status_message = %s WHERE id = %s"
+                cursor.execute(update_query, (False, datetime.now(), error_msg, chatbot_id))
+                conn.commit()
+                if cursor: cursor.close()
+                if conn and conn.is_connected(): conn.close()
+                return
+        os.makedirs(client_chroma_path, exist_ok=True)
+        
+        all_extracted_records = [] # This will now hold structured dictionaries
+        
+        for i, input_item in enumerate(data_sources):
+            socketio.emit('processing_status', {'chatbot_id': chatbot_id, 'status': 'in_progress', 'message': f'Processing item {i+1}/{len(data_sources)}: {input_item}'}, room=user_id)
+            processed_records = await process_single_input(input_item, use_js_render=True)
+            all_extracted_records.extend(processed_records)
+
+            if os.path.exists(input_item) and input_item.startswith(UPLOAD_DIR):
+                try:
+                    os.remove(input_item)
+                    logger.info(f"Cleaned up uploaded file: {input_item}")
+                except OSError as e:
+                    logger.error(f"Error cleaning up file {input_item}: {e}")
+        
+        if not all_extracted_records:
+            socketio.emit('processing_status', {'chatbot_id': chatbot_id, 'status': 'failed', 'message': 'No content processed. Skipping vector store creation.'}, room=user_id)
+            update_query = "UPDATE chatbots SET is_ready = %s, updated_at = %s, status_message = %s WHERE id = %s"
+            cursor.execute(update_query, (False, datetime.now(), 'No content processed', chatbot_id))
+            conn.commit()
+            if cursor: cursor.close()
+            if conn and conn.is_connected(): conn.close()
+            return
+        
+        all_docs_for_embedding = []
+        for record in all_extracted_records:
+            # Construct a comprehensive page_content from all relevant record data
+            # This ensures all fields contribute to embedding and LLM understanding for general queries
+            content_parts_for_page = []
+            for k, v in record.items():
+                # Exclude metadata fields that are already distinct or redundant in text content
+                if k not in ['url', 'title', 'source', 'is_subpage', 'file_type', 'text_content'] and v:
+                    content_parts_for_page.append(f"{k.replace('_', ' ').title()}: {v}")
+            
+            # Add the original text_content as well, in case it was unstructured or had additional context
+            if record.get('text_content'):
+                content_parts_for_page.append(record['text_content'])
+
+            final_page_content = "\n".join(content_parts_for_page).strip()
+            # Clean up excessive newlines/spaces that might result from concatenation
+            final_page_content = re.sub(r'\n\s*\n', '\n\n', final_page_content)
+            final_page_content = re.sub(r'\s+', ' ', final_page_content) # Reduce multiple spaces to single
+            
+            if not final_page_content.strip():
+                continue # Skip empty documents
+
+            # Prepare metadata: remove 'text_content' from metadata as it's now in page_content
+            # Ensure all metadata values are serializable (e.g., convert Path/datetime to string)
+            metadata = {k: v for k, v in record.items() if k != 'text_content'} 
+            metadata["client_id"] = chatbot_id # Ensure client_id is in metadata
+
+            for key, value in metadata.items():
+                if isinstance(value, datetime):
+                    metadata[key] = value.isoformat()
+                elif isinstance(value, Path):
+                    metadata[key] = str(value)
+                elif isinstance(value, (int, float, bool)): # Ensure primitive types are handled
+                    metadata[key] = value
+                elif value is None: # Convert None to empty string or remove, depending on preference. Here, set to empty string
+                    metadata[key] = ""
+                else: # For other complex types, stringify as a last resort
+                    metadata[key] = str(value)
+
+            all_docs_for_embedding.append(Document(page_content=final_page_content, metadata=metadata))
+        
+        if not all_docs_for_embedding:
+            socketio.emit('processing_status', {'chatbot_id': chatbot_id, 'status': 'failed', 'message': 'No valid documents prepared for embedding after filtering.'}, room=user_id)
+            update_query = "UPDATE chatbots SET is_ready = %s, updated_at = %s, status_message = %s WHERE id = %s"
+            cursor.execute(update_query, (False, datetime.now(), 'No valid documents for embedding', chatbot_id))
+            conn.commit()
+            if cursor: cursor.close()
+            if conn and conn.is_connected(): conn.close()
+            return
+
+        socketio.emit('processing_status', {'chatbot_id': chatbot_id, 'status': 'in_progress', 'message': f'Prepared {len(all_docs_for_embedding)} documents for embedding.'}, room=user_id)
+
+        # RecursiveCharacterTextSplitter is a good general-purpose splitter.
+        # For structured records, it will chunk the 'final_page_content' which now includes a summary.
+        # This is generally fine, but if individual records are very small, chunking might not be strictly necessary.
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200, length_function=len, add_start_index=True)
+        chunks = text_splitter.split_documents(all_docs_for_embedding)
+        socketio.emit('processing_status', {'chatbot_id': chatbot_id, 'status': 'in_progress', 'message': f'Created {len(chunks)} text chunks.'}, room=user_id)
+
+        if embeddings is None:
+            socketio.emit('processing_status', {'chatbot_id': chatbot_id, 'status': 'failed', 'message': 'Embedding model not loaded.'}, room=user_id)
+            update_query = "UPDATE chatbots SET is_ready = %s, updated_at = %s, status_message = %s WHERE id = %s"
+            cursor.execute(update_query, (False, datetime.now(), 'Embedding model error', chatbot_id))
+            conn.commit()
+            if cursor: cursor.close()
+            if conn and conn.is_connected(): conn.close()
+            return
+
+        socketio.emit('processing_status', {'chatbot_id': chatbot_id, 'status': 'in_progress', 'message': 'Creating/Updating vector store...'}, room=user_id)
+        vectordb = Chroma.from_documents(documents=chunks, embedding=embeddings, persist_directory=client_chroma_path)
+        
+        # Mark chatbot ready after successful vector store creation
+        update_query = "UPDATE chatbots SET is_ready = %s, updated_at = %s, status_message = %s WHERE id = %s"
+        cursor.execute(update_query, (True, datetime.now(), 'Ready', chatbot_id))
+        conn.commit()
+        
+        socketio.emit('processing_status', {'chatbot_id': chatbot_id, 'status': 'completed', 'message': 'Vector store created and chatbot ready!'}, room=user_id)
+        
+        # Save raw data for debugging/logging (now structured)
+        output_filename = os.path.join(client_chroma_path, f"{chatbot_id}_processed_data.json")
+        final_output_json = {
+            "processing_info": { "inputs": data_sources, "total_items_processed": len(all_extracted_records),
+                "total_documents_embedded": len(all_docs_for_embedding), "total_chunks_created": len(chunks), "js_rendering_used": True
+            },
+            "processed_items": all_extracted_records # Save the structured records
+        }
+        json.dump(final_output_json, open(output_filename, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+        print(f"Raw processed data (structured) saved to '{output_filename}'")
+
+    except Exception as e:
+        logger.error(f"Error processing data for chatbot '{chatbot_id}': {e}", exc_info=True)
+        socketio.emit('processing_status', {'chatbot_id': chatbot_id, 'status': 'failed', 'message': f'Processing failed: {str(e)}'}, room=user_id)
+        # Ensure status is set to failed in DB if any error occurs
+        try:
+            conn = get_db_connection() # Re-establish connection if it was closed
+            cursor = conn.cursor()
+            update_query = "UPDATE chatbots SET is_ready = %s, updated_at = %s, status_message = %s WHERE id = %s"
+            cursor.execute(update_query, (False, datetime.now(), f'Processing failed: {str(e)[:250]}', chatbot_id))
+            conn.commit()
+        except Exception as db_err:
+            logger.error(f"Failed to update chatbot status to 'failed' in DB: {db_err}")
+
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception as e:
+                logger.error(f"Error closing cursor in process_chatbot_data during error handling: {e}")
+        if conn and conn.is_connected():
+            try:
+                conn.close()
+            except Exception as e:
+                logger.error(f"Error closing connection in process_chatbot_data during error handling: {e}")
+
+
+async def get_or_load_vectordb_for_chat(chatbot_id: str, owner_user_id: str):
+    """
+    Retrieves or loads the ChromaDB for a specific chatbot used in chat.
+    Fetches chatbot config from MySQL.
+    """
+    logger.info(f"get_or_load_vectordb_for_chat: Starting for chatbot {chatbot_id}")
+    conn = None
+    cursor = None
+    config = None # Initialize config here
+    try:
+        logger.info(f"get_or_load_vectordb_for_chat: Attempting to get DB connection...")
+        conn = get_db_connection()
+        if conn is None:
+            logger.error("get_or_load_vectordb_for_chat: Failed to get DB connection.")
+            return None, None # Return None for both vectordb and config if connection fails
+
+        logger.info(f"get_or_load_vectordb_for_chat: Executing DB query for chatbot {chatbot_id} and owner {owner_user_id}...")
+        cursor = conn.cursor(dictionary=True) # Use dictionary=True to fetch rows as dicts
+        select_query = "SELECT * FROM chatbots WHERE id = %s AND user_id = %s"
+        cursor.execute(select_query, (chatbot_id, owner_user_id))
+        logger.info(f"get_or_load_vectordb_for_chat: Fetching result from DB for chatbot {chatbot_id}...")
+        config = cursor.fetchone() # 'config' is the dict from DB
+        logger.info(f"get_or_load_vectordb_for_chat: DB query returned config: True.")
+        if cursor:
+            try:
+                cursor.close()
+            except Exception as e:
+                logger.error(f"Error closing cursor immediately after fetch in get_or_load_vectordb_for_chat: {e}")
+
+
+        if not config:
+            logger.error(f"get_or_load_vectordb_for_chat: Chatbot '{chatbot_id}' not found for user '{owner_user_id}'.")
+            from werkzeug.exceptions import HTTPException
+            raise HTTPException(description=f"Chatbot '{chatbot_id}' not found for user '{owner_user_id}'.", code=404)
+        
+        # Ensure 'data_sources' is a list
+        if 'data_sources' in config and config['data_sources'] is not None:
+            try:
+                config['data_sources'] = json.loads(config['data_sources'])
+                logger.info(f"get_or_load_vectordb_for_chat: Successfully decoded data_sources for chatbot {chatbot_id}.")
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.error(f"get_or_load_vectordb_for_chat: Error decoding data_sources for chatbot {chatbot_id}: {e}. Raw data: {config['data_sources']}", exc_info=True)
+                config['data_sources'] = [] # Default to empty list on error
+        else:
+            config['data_sources'] = [] # Ensure it's an empty list if None or not present
+
+        logger.info(f"get_or_load_vectordb_for_chat: Instantiating ChatbotConfigSchema for chatbot {chatbot_id}...")
+        processed_chatbot_data = {}
+        for key, value in config.items():
+            if key == 'id':
+                processed_chatbot_data[key] = str(value)
+            elif key == 'user_id' and not isinstance(value, str):
+                processed_chatbot_data[key] = str(value)
+            else:
+                processed_chatbot_data[key] = value
+
+        if 'temperature' in config and config['temperature'] is not None:
+            processed_chatbot_data['temperature'] = float(config['temperature'])
+        if 'max_tokens' in config and config['max_tokens'] is not None:
+            processed_chatbot_data['max_tokens'] = int(config['max_tokens'])
+
+        if 'top_k' in config and config['top_k'] is not None:
+            processed_chatbot_data['top_k'] = int(config['top_k'])
+        else:
+            processed_chatbot_data['top_k'] = 3 # Default value if not in DB
+
+
+        chatbot_config = ChatbotConfigSchema(**processed_chatbot_data)
+        logger.info(f"get_or_load_vectordb_for_chat: ChatbotConfigSchema instantiated. is_ready: True")
+
+        # The error you reported is due to this check:
+        if not chatbot_config.is_ready:
+            logger.warning(f"get_or_load_vectordb_for_chat: Chatbot '{chatbot_id}' is not ready, raising conflict.")
+            from werkzeug.exceptions import Conflict
+            raise Conflict(description=f"Chatbot '{chatbot_id}' is still processing its knowledge base. Please try again later.")
+
+        vectordb_instance = None # Initialize vectordb_instance here
+        if chatbot_id not in loaded_vectorstores:
+            client_chroma_path = os.path.join(CHROMA_DB_BASE_PATH, chatbot_id)
+            logger.info(f"get_or_load_vectordb_for_chat: Checking if ChromaDB path exists: {client_chroma_path}")
+            if not os.path.exists(client_chroma_path):
+                logger.error(f"get_or_load_vectordb_for_chat: Knowledge base directory not found for chatbot: {chatbot_id}. This should have been caught by startup_event.")
+                # This should ideally be caught by startup_event. If not, mark as not ready.
+                # However, for immediate error response, raise HTTP 404 here.
+                from werkzeug.exceptions import NotFound
+                raise NotFound(description=f"Knowledge base directory not found for chatbot: {chatbot_id}. It might have been deleted or not processed correctly. Please try reprocessing.")
+            
+            logger.info(f"get_or_load_vectordb_for_chat: Loading ChromaDB for chatbot '{chatbot_id}' from {client_chroma_path}...")
+            try:
+                vectordb_instance = Chroma(
+                    persist_directory=client_chroma_path, embedding_function=embeddings
+                )
+                logger.info(f"get_or_load_vectordb_for_chat: ChromaDB loaded. Performing health check...")
+                
+                collection = vectordb_instance.get()
+                doc_count = len(collection['ids']) if collection and collection['ids'] else 0
+                logger.info(f"get_or_load_vectordb_for_chat: ChromaDB loaded for chatbot '{chatbot_id}' with {doc_count} documents. Health check successful. Inference ready.")
+                
+                loaded_vectorstores[chatbot_id] = vectordb_instance
+            except Exception as e:
+                logger.error(f"get_or_load_vectordb_for_chat: Error loading ChromaDB for chatbot '{chatbot_id}': {e}", exc_info=True)
+                from werkzeug.exceptions import InternalServerError
+                raise InternalServerError(description=f"Failed to load knowledge base for chatbot: {chatbot_id}")
+        else:
+            vectordb_instance = loaded_vectorstores[chatbot_id]
+            logger.info(f"get_or_load_vectordb_for_chat: Using cached ChromaDB for chatbot '{chatbot_id}'.")
+        
+        return vectordb_instance, chatbot_config
+    except Exception as e:
+        logger.error(f"get_or_load_vectordb_for_chat: An unexpected error occurred: {e}", exc_info=True)
+        raise
+
+    finally:
+        if conn and conn.is_connected():
+            try:
+                conn.close()
+                logger.info(f"get_or_load_vectordb_for_chat: Closed DB connection for chatbot {chatbot_id}")
+            except Exception as e:
+                logger.error(f"Error closing connection in get_or_load_vectordb_for_chat: {e}")
+
+
+# Add this function definition somewhere before its usage in the chat_endpoint
+def get_relevant_docs(vectordb: Chroma, query: str, k: int = 3) -> List[Document]:
+    """
+    Retrieves the most relevant documents from the vector database based on the query.
+    """
+    return vectordb.similarity_search(query, k=k)
+
+    # Option 2: Using as_retriever() (more flexible, especially for chains)
+    # retriever = vectordb.as_retriever(search_kwargs={"k": k})
+    # return retriever.invoke(query)
+
+
+@app.route("/request_handoff", methods=["POST"])
+async def request_handoff():
+    try:
+        handoff_data = HumanHandoffRequestSchema.parse_obj(request.json)
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        insert_query = """
+        INSERT INTO handoff_requests (id, chatbot_id, user_id, user_name, user_email, user_phone, query_history, summary, status, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        # Convert List[Dict] to JSON string for storage
+        query_history_json = json.dumps(handoff_data.query_history)
+
+        cursor.execute(insert_query, (
+            handoff_data.id, handoff_data.chatbot_id, handoff_data.user_id, # user_id here is the owner_user_id from the widget
+            handoff_data.user_name, handoff_data.user_email, handoff_data.user_phone,
+            query_history_json, handoff_data.summary, handoff_data.status, handoff_data.created_at
+        ))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        # Notify admins via Socket.IO
+        # Admins will listen on a specific socket.io room.
+        socketio.emit('new_handoff_request', {
+            'id': handoff_data.id,
+            'chatbot_id': handoff_data.chatbot_id,
+            'user_email': handoff_data.user_email,
+            'summary': handoff_data.summary
+        }, room='admins') 
+
+        logger.info(f"Handoff request created for chatbot {handoff_data.chatbot_id} by {handoff_data.user_email}")
+        return jsonify({"message": "Handoff request submitted successfully. A human agent will contact you soon."}), 200
+    except Exception as e:
+        logger.error(f"Error processing handoff request: {e}", exc_info=True)
+        return jsonify({"detail": f"Failed to submit handoff request: {e}"}), 500
+
+# --- User & Chatbot Management Endpoints (for Laravel Frontend) ---
+# These endpoints require API key authentication from the Laravel frontend
+
+@app.route("/api/register_user_backend", methods=["POST"])
+@api_key_required
+# Changed from async def to def
+def register_user_backend():
+    # This endpoint is called by Laravel's registration process to store the user in MySQL.
+    try:
+        data = request.json
+        user_id = data.get('uid') # Laravel will pass its user ID here
+        user_email = data.get('email')
+
+        if not user_id or not user_email:
+            return jsonify({"detail": "User ID and Email are required."}), 400
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Check if user already exists
+        select_query = "SELECT uid FROM users WHERE uid = %s"
+        cursor.execute(select_query, (user_id,))
+        existing_user = cursor.fetchone()
+
+        if existing_user:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "User already registered in backend DB"}), 200
+        
+        insert_query = "INSERT INTO users (uid, email, created_at) VALUES (%s, %s, %s)"
+        user_profile = UserProfile(uid=user_id, email=user_email, created_at=datetime.now()) # Use current time for consistency
+        cursor.execute(insert_query, (user_profile.uid, user_profile.email, user_profile.created_at))
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        logger.info(f"User {user_id} registered in backend DB.")
+        return jsonify({"message": "User registered successfully in backend", "user_id": user_id}), 201
+    except Exception as e:
+        logger.error(f"Error registering user in backend: {e}", exc_info=True)
+        return jsonify({"detail": f"Failed to register user in backend: {e}"}), 500
+
+
+@app.route("/api/chatbots/<user_id>", methods=["GET"]) # user_id now passed in path
+@api_key_required
+# Changed from async def to def
+def get_user_chatbots(user_id: str):
+    # user_id is the Laravel user's ID
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    select_query = "SELECT id, user_id, name, description, llm_type, is_ready, created_at, updated_at, embed_url, status_message FROM chatbots WHERE user_id = %s"
+    cursor.execute(select_query, (user_id,))
+    chatbots_list = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    for chatbot in chatbots_list:
+        if 'created_at' in chatbot and chatbot['created_at']:
+            chatbot['created_at'] = chatbot['created_at'].isoformat()
+        if 'updated_at' in chatbot and chatbot['updated_at']:
+            chatbot['updated_at'] = chatbot['updated_at'].isoformat()
+    
+    return jsonify(chatbots_list), 200
+
+    
+def get_chatbot_config(chatbot_id: str, owner_user_id: str):
+    conn = None
+    try:
+        conn = get_db_connection()
+        if conn is None:
+            return None
+
+        cursor = conn.cursor(dictionary=True) # Use dictionary=True to fetch rows as dicts
+        # CORRECTED LINE: Changed 'owner_user_id' to 'user_id' to match your schema
+        query = "SELECT * FROM chatbots WHERE id = %s AND user_id = %s"
+        cursor.execute(query, (chatbot_id, owner_user_id))
+        config = cursor.fetchone()
+        cursor.close()
+        return config
+    except MySQL_Error as e:
+        logger.error(f"Error fetching chatbot configuration for ID {chatbot_id}, Owner {owner_user_id}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"An unexpected error occurred in get_chatbot_config: {e}", exc_info=True)
+        return None
+    finally:
+        if conn and conn.is_connected():
+            conn.close()
+
+@app.route("/api/create_chatbot", methods=["POST"])
+@api_key_required
+def create_chatbot():
+    """
+    Creates a new chatbot entry in the database and initiates data processing.
+    """
+    conn = None
+    cursor = None
+    try:
+        user_id = request.form.get('user_id')
+        name = request.form.get('name')
+        description = request.form.get('description')
+        llm_type = request.form.get('llm_type', 'LM_STUDIO')
+        openai_api_key = request.form.get('openai_api_key')
+
+        if not user_id or not name:
+            return jsonify({"detail": "User ID and Chatbot Name are required."}), 400
+
+        files = request.files.getlist('files[]')
+        urls_input = request.form.get('urls', '')
+        urls = [url.strip() for url in urls_input.split('\n') if url.strip()]
+
+        temp_file_paths = []
+        for file in files:
+            if file and file.filename:
+                filename = secure_filename(file.filename)
+                file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                file.save(file_path)
+                temp_file_paths.append(file_path)
+                logger.info(f"Saved uploaded file: {file_path}")
+
+        combined_data_sources = temp_file_paths + urls
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        insert_query = """
+        INSERT INTO chatbots (user_id, name, description, data_sources, llm_type, openai_api_key, is_ready, created_at, updated_at, embed_url, status_message)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        data_sources_json = json.dumps(combined_data_sources)
+
+        cursor.execute(insert_query, (
+            user_id, name, description, data_sources_json, llm_type,
+            openai_api_key if llm_type == "OPENAI" else None, False,
+            datetime.now(), datetime.now(), None,
+            'Pending data processing'
+        ))
+        
+        new_chatbot_id = cursor.lastrowid
+        chatbot_id_str = str(new_chatbot_id)
+
+        embed_url = f"{request.url_root.rstrip('/')}/embed/{chatbot_id_str}?ownerId={user_id}"
+        update_embed_url_query = "UPDATE chatbots SET embed_url = %s WHERE id = %s"
+        cursor.execute(update_embed_url_query, (embed_url, new_chatbot_id))
+
+        conn.commit()
+        if cursor:
+            try:
+                cursor.close()
+                pass
+            except Exception as e:
+                logger.error(f"Error closing cursor in create_chatbot (success): {e}")
+        if conn and conn.is_connected():
+            try:
+                conn.close()
+                pass # Fixed: No error message passed to `logger.error` if there's no exception.
+            except Exception as e: # Catch the exception if `conn.close()` fails
+                logger.error(f"Error closing connection in create_chatbot (success): {e}")
+        
+        logger.info(f"Chatbot entry created with ID: {chatbot_id_str}")
+
+        if combined_data_sources:
+            # Use eventlet.spawn to run the async function in a greenlet
+            eventlet.spawn(process_chatbot_data, chatbot_id_str, user_id, combined_data_sources)
+        else:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            update_query = """
+            UPDATE chatbots SET is_ready = %s, updated_at = %s, status_message = %s
+            WHERE id = %s
+            """
+            cursor.execute(update_query, (True, datetime.now(), 'Ready (No data sources provided)', new_chatbot_id))
+            conn.commit()
+            if cursor:
+                try:
+                    cursor.close()
+                    pass
+                except Exception as e:
+                    logger.error(f"Error closing cursor in create_chatbot (no data sources): {e}")
+            if conn and conn.is_connected():
+                try:
+                    conn.close()
+                    pass
+                except Exception as e:
+                    logger.error(f"Error closing connection in create_chatbot (no data sources): {e}")
+            socketio.emit('processing_status', {'chatbot_id': chatbot_id_str, 'status': 'completed', 'message': 'Chatbot created without data sources.'}, room=user_id)
+
+        return jsonify({"message": "Chatbot creation initiated. Data processing will start shortly.", "chatbot_id": chatbot_id_str, "embed_url": embed_url}), 201
+    except Exception as e:
+        logger.error(f"Error creating chatbot: {e}", exc_info=True)
+        return jsonify({"detail": f"Failed to create chatbot: {e}"}), 400
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception as e:
+                logger.error(f"Error closing cursor in create_chatbot: {e}")
+        if conn and conn.is_connected():
+            try:
+                conn.close()
+            except Exception as e:
+                logger.error(f"Error closing connection in create_chatbot: {e}")
+
+
+@app.route("/api/update_chatbot_data/<chatbot_id>", methods=["POST"])
+@api_key_required
+def update_chatbot_data(chatbot_id: str):
+    """
+    Updates a chatbot's data sources and re-initiates data processing.
+    """
+    conn = None
+    cursor = None
+    try:
+        user_id = request.form.get('user_id')
+        if not user_id:
+            return jsonify({"detail": "User ID is required for this operation."}), 400
+
+        files = request.files.getlist('files[]')
+        
+        urls = request.form.getlist('urls[]') 
+        urls = [url.strip() for url in urls if url.strip()] 
+
+        if not files and not urls:
+            return jsonify({"detail": "No files or URLs provided for data update."}), 400
+
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        select_query = "SELECT user_id, data_sources FROM chatbots WHERE id = %s"
+        cursor.execute(select_query, (chatbot_id,))
+        chatbot_record = cursor.fetchone()
+
+        if not chatbot_record or str(chatbot_record['user_id']) != str(user_id):
+            if cursor:
+                try:
+                    cursor.close()
+                    pass
+                except Exception as e:
+                    logger.error(f"Error closing cursor in update_chatbot_data (permission check): {e}")
+            if conn and conn.is_connected():
+                try:
+                    conn.close()
+                    pass
+                except Exception as e:
+                    logger.error(f"Error closing connection in update_chatbot_data (permission check): {e}")
+            return jsonify({"detail": "Chatbot not found or you don't have permission."}), 404
+
+        temp_file_paths = []
+        for file in files:
+            if file and file.filename:
+                filename = secure_filename(file.filename)
+                file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                file.save(file_path)
+                temp_file_paths.append(file_path)
+                logger.info(f"Saved uploaded file: {file_path}")
+
+        existing_data_sources = json.loads(chatbot_record['data_sources']) if chatbot_record['data_sources'] else []
+        combined_data_sources = list(set(existing_data_sources + temp_file_paths + urls))
+
+        data_sources_json = json.dumps(combined_data_sources)
+
+        update_query = """
+        UPDATE chatbots SET data_sources = %s, is_ready = %s, updated_at = %s, status_message = %s
+        WHERE id = %s
+        """
+        cursor.execute(update_query, (data_sources_json, False, datetime.now(), 'Processing data...', chatbot_id))
+        conn.commit()
+        if cursor:
+            try:
+                cursor.close()
+                pass
+            except Exception as e:
+                logger.error(f"Error closing cursor in update_chatbot_data (success): {e}")
+        if conn and conn.is_connected():
+            try:
+                conn.close()
+                pass
+            except Exception as e:
+                logger.error(f"Error closing connection in update_chatbot_data (success): {e}")
+        
+        # Use eventlet.spawn to run the async function in a greenlet
+        # eventlet.spawn(process_chatbot_data, chatbot_id, user_id, combined_data_sources)
+        threading.Thread(
+        target=lambda: asyncio.run(process_chatbot_data(chatbot_id, user_id, combined_data_sources))
+        ).start()
+        
+        return jsonify({"message": "Data update initiated. Chatbot will be ready shortly.", "data_sources": combined_data_sources}), 200
+    except Exception as e:
+        logger.error(f"Error updating chatbot data: {e}", exc_info=True)
+        return jsonify({"detail": f"Failed to update chatbot data: {e}"}), 400
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception as e:
+                logger.error(f"Error closing cursor in update_chatbot_data: {e}")
+        if conn and conn.is_connected():
+            try:
+                conn.close()
+            except Exception as e:
+                logger.error(f"Error closing connection in update_chatbot_data: {e}")
+
+@app.route("/api/delete_chatbot/<chatbot_id>", methods=["DELETE"])
+@api_key_required
+def delete_chatbot(chatbot_id):
+    """
+    Deletes a chatbot and its associated knowledge base.
+    """
+    conn = None
+    cursor = None
+    try:
+        user_id = request.json.get('user_id')
+
+        if not user_id:
+            logger.warning(f"Delete chatbot failed: user_id missing for chatbot_id: {chatbot_id}")
+            return jsonify({"detail": "User ID is required for deletion."}), 400
+
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        select_query = "SELECT user_id FROM chatbots WHERE id = %s"
+        cursor.execute(select_query, (chatbot_id,))
+        chatbot_record = cursor.fetchone()
+
+        if not chatbot_record:
+            logger.warning(f"Delete chatbot failed: Chatbot with ID {chatbot_id} not found.")
+            if cursor:
+                try:
+                    cursor.close()
+                    pass
+                except Exception as e:
+                    logger.error(f"Error closing cursor in delete_chatbot (not found): {e}")
+            if conn and conn.is_connected():
+                try:
+                    conn.close()
+                    pass
+                except Exception as e:
+                    logger.error(f"Error closing connection in delete_chatbot (not found): {e}")
+            return jsonify({"detail": "Chatbot not found."}), 404
+
+        if str(chatbot_record['user_id']) != str(user_id):
+            logger.warning(f"Delete chatbot failed: Unauthorized attempt by user {user_id} to delete chatbot {chatbot_id} owned by {chatbot_record['user_id']}")
+            if cursor:
+                try:
+                    cursor.close()
+                    pass
+                except Exception as e:
+                    logger.error(f"Error closing cursor in delete_chatbot (unauthorized): {e}")
+            if conn and conn.is_connected():
+                try:
+                    conn.close()
+                    pass
+                except Exception as e:
+                    logger.error(f"Error closing connection in delete_chatbot (unauthorized): {e}")
+            return jsonify({"detail": "Unauthorized: You do not own this chatbot."}), 403
+
+        delete_db_query = "DELETE FROM chatbots WHERE id = %s"
+        cursor.execute(delete_db_query, (chatbot_id,))
+        conn.commit()
+
+        logger.info(f"Chatbot {chatbot_id} deleted from database for user {user_id}.")
+
+        chatbot_vector_store_path = os.path.join(CHROMA_DB_BASE_PATH, chatbot_id)
+
+        if os.path.exists(chatbot_vector_store_path):
+            try:
+                shutil.rmtree(chatbot_vector_store_path)
+                logger.info(f"Vector store directory for chatbot {chatbot_id} deleted: {chatbot_vector_store_path}")
+            except OSError as e:
+                logger.error(f"Error deleting vector store directory {chatbot_vector_store_path}: {e}")
+        else:
+            logger.warning(f"Vector store directory not found for chatbot {chatbot_id}: {chatbot_vector_store_path}")
+
+
+        if cursor:
+            try:
+                cursor.close()
+                pass
+            except Exception as e:
+                logger.error(f"Error closing cursor in delete_chatbot (success): {e}")
+        if conn and conn.is_connected():
+            try:
+                conn.close()
+                pass
+            except Exception as e:
+                logger.error(f"Error closing connection in delete_chatbot (success): {e}")
+
+        return jsonify({"message": "Chatbot deleted successfully."}), 200
+
+    except MySQL_Error as e:
+        logger.error(f"MySQL Error during chatbot deletion for {chatbot_id}: {e}")
+        return jsonify({"detail": f"Database error: {e.msg}"}), 500
+    except Exception as e:
+        logger.error(f"Unexpected error during chatbot deletion for {chatbot_id}: {e}")
+        return jsonify({"detail": f"An internal server error occurred: {str(e)}"}), 500
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception as e:
+                logger.error(f"Error closing cursor in delete_chatbot: {e}")
+        if conn and conn.is_connected():
+            try:
+                conn.close()
+            except Exception as e:
+                logger.error(f"Error closing connection in delete_chatbot: {e}")
+
+# --- Admin Endpoints ---
+@app.route("/admin/handoffs", methods=["GET"])
+@api_key_required # Admin dashboard calls this, authenticated by API key
+# Changed from async def to def
+def get_all_handoff_requests():
+    # In a production app, add specific admin role check here.
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    select_query = "SELECT id, chatbot_id, user_id, user_name, user_email, user_phone, query_history, summary, status, created_at, resolved_at, agent_notes FROM handoff_requests ORDER BY created_at DESC"
+    cursor.execute(select_query)
+    handoff_list = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    for handoff in handoff_list:
+        if 'created_at' in handoff and handoff['created_at']:
+            handoff['created_at'] = handoff['created_at'].isoformat()
+        if 'resolved_at' in handoff and handoff['resolved_at']:
+            handoff['resolved_at'] = handoff['resolved_at'].isoformat()
+        if 'query_history' in handoff and handoff['query_history']:
+            handoff['query_history'] = json.loads(handoff['query_history'])
+
+    return jsonify(handoff_list), 200
+
+
+@app.route("/admin/handoffs/<handoff_id>/resolve", methods=["POST"])
+@api_key_required # Admin dashboard calls this, authenticated by API key
+# Changed from async def to def
+def resolve_handoff_request(handoff_id: str):
+    # Admin role check goes here in production
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    update_query = """
+    UPDATE handoff_requests SET status = %s, resolved_at = %s
+    WHERE id = %s
+    """
+    cursor.execute(update_query, ('resolved', datetime.now(), handoff_id))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return jsonify({"message": "Handoff request marked as resolved."}), 200
+
+
+# --- Embeddable Chatbot Widget HTML endpoint ---
+@app.route("/embed/<chatbot_id>")
+# Changed from async def to def (as it renders a template, not awaiting external async ops)
+def embed_chatbot_widget(chatbot_id: str):
+    # owner_user_id is needed to retrieve the correct chatbot config from MySQL
+    owner_user_id = request.args.get('ownerId')
+    if not owner_user_id:
+        return "Error: ownerId parameter missing from embed URL.", 400
+
+    return render_template('chatbot_embed_widget.html',
+        chatbot_id=chatbot_id,
+        owner_user_id=owner_user_id,
+        backend_url=request.url_root.rstrip('/')
+    )
+
+
+@app.route("/")
+def index():
+    return "Flask Backend Running. Access Laravel Frontend for management."
+
+# Session Management Helper Functions
+def create_session(chatbot_id, owner_user_id, client_sid):
+    """Create a new chat session"""
+    session_id = str(uuid.uuid4())
+    session_data = {
+        'session_id': session_id,
+        'chatbot_id': chatbot_id,
+        'owner_user_id': owner_user_id,
+        'client_sid': client_sid,
+        'created_at': datetime.now(),
+        'last_activity': datetime.now(),
+        'message_count': 0,
+        'is_active': True
+    }
+    active_sessions[session_id] = session_data
+    return session_data
+
+def update_session_activity(session_id):
+    """Update last activity timestamp for a session"""
+    if session_id in active_sessions:
+        active_sessions[session_id]['last_activity'] = datetime.now()
+
+def end_session(session_id):
+    """End a chat session"""
+    if session_id in active_sessions:
+        active_sessions[session_id]['is_active'] = False
+        # Optionally save to database here
+        del active_sessions[session_id]
+
+
+async def _process_chat_message_async(message_data, sid):
+    global embeddings # Assuming embeddings is initialized globally
+
+    start_time = time.time()
+    session_id = message_data.get('session_id')
+
+    try:
+        chat_request = ChatRequestSchema(**message_data)
+        query = chat_request.query
+        # chat_history = chat_request.chat_history
+        chatbot_id = chat_request.chatbot_id
+        owner_user_id = chat_request.owner_user_id
+
+        logger.info(f"Received chat message for chatbot_id {chatbot_id}, owner: {owner_user_id}, query: '{query[:50]}...'")
+        socketio.emit('typing_indicator', {'typing': True}, room=sid)
+
+        config = get_chatbot_config(chatbot_id, owner_user_id)
+        if not config:
+            error_message = "Chatbot configuration not found."
+            logger.error(error_message)
+            socketio.emit('chat_response', {
+                'answer': f"Error: {error_message}", 'source_documents': [], 'hand_off_required': False,
+                'turn_off_bot': False, 'session_id': session_id, 'timestamp': time.time(), 'error': "Configuration error"
+            }, room=sid)
+            socketio.emit('typing_indicator', {'typing': False}, room=sid)
+            return
+
+        # GREETING_KEYWORDS = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening", "greetings"]
+        # if any(greeting in query.lower() for greeting in GREETING_KEYWORDS):
+        #     socketio.emit('chat_response', {
+        #         'answer': "Hello! How can I assist you today?", 'source_documents': [], 'hand_off_required': False,
+        #         'turn_off_bot': False, 'session_id': session_id, 'timestamp': time.time()
+        #     }, room=sid)
+        #     socketio.emit('typing_indicator', {'typing': False}, room=sid)
+        #     return
+
+        turn_off_keywords = ["bye", "thank you", "thanks", "goodbye", "exit", "close chat", "end chat"]
+        if any(keyword in query.lower() for keyword in turn_off_keywords):
+            socketio.emit('chat_response', {
+                'answer': "You're welcome! If you have any more questions, feel yourself to ask. Goodbye!", 'source_documents': [],
+                'hand_off_required': False, 'turn_off_bot': True, 'session_id': session_id, 'timestamp': time.time()
+            }, room=sid)
+            socketio.emit('typing_indicator', {'typing': False}, room=sid)
+            return
+
+        vectordb = None
+        # current_llm will not be directly returned by get_or_load_vectordb_for_chat for LM Studio anymore.
+        # We will configure LLM call parameters directly.
+        try:
+            # get_or_load_vectordb_for_chat might still return a dummy LLM or None if it expects it.
+            # Adjust its return type if it only provides vectordb for LM Studio path.
+            # For this example, we assume we only need vectordb from it.
+            vectordb, _ = await get_or_load_vectordb_for_chat(chatbot_id, owner_user_id)
+        except HTTPException as e:
+            logger.error(f"Error loading chatbot resources: {e.description}")
+            socketio.emit('chat_response', {
+                'answer': f"I'm sorry, I couldn't load the chatbot's knowledge base. {e.description}", 'source_documents': [],
+                'hand_off_required': False, 'turn_off_bot': False, 'session_id': session_id,
+                'timestamp': time.time(), 'error': "Chatbot resource error"
+            }, room=sid)
+            socketio.emit('typing_indicator', {'typing': False}, room=sid)
+            return
+        except Exception as e:
+            logger.error(f"Unexpected error loading chatbot resources: {e}", exc_info=True)
+            socketio.emit('chat_response', {
+                'answer': f"An unexpected error occurred while setting up the chatbot. Please try again.", 'source_documents': [],
+                'hand_off_required': False, 'turn_off_bot': False, 'session_id': session_id,
+                'timestamp': time.time(), 'error': "Resource loading error"
+            }, room=sid)
+            socketio.emit('typing_indicator', {'typing': False}, room=sid)
+            return
+
+        # Define LLM parameters for direct httpx call
+        lm_studio_api_base_url = os.getenv("LM_STUDIO_API_BASE_URL", "http://192.168.234.1:1234/v1")
+        lm_studio_model_name = os.getenv("LM_STUDIO_MODEL_NAME", "gemm3:4b") # Ensure you set this env var
+        llm_temperature = config.get('temperature', 0.1)
+        llm_max_tokens = config.get('max_tokens', 100000)
+
+        # For handoff summary, use the same direct httpx call approach
+        handoff_keywords = ["human", "agent", "talk to someone", "representative", "live chat"]
+        if any(keyword in query.lower() for keyword in handoff_keywords):
+            summary_prompt = f"Summarize the user's current request for a human agent in 1-2 sentences, based on their last query: '{query}'"
+            summary_for_agent = ""
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        f"{lm_studio_api_base_url}/chat/completions",
+                        json={
+                            "model": lm_studio_model_name,
+                            "messages": [{"role": "user", "content": summary_prompt}],
+                            "temperature": llm_temperature,
+                            "max_tokens": llm_max_tokens,
+                            "stream": False # Explicitly set to false for non-streaming
+                        },
+                        timeout=30.0 # Shorter timeout for summary call
+                    )
+                    response.raise_for_status() # Raise an exception for bad status codes
+                    summary_data = response.json()
+                    summary_for_agent = summary_data['choices'][0]['message']['content'].strip()
+            except (httpx.RequestError, httpx.TimeoutException, KeyError, IndexError) as e:
+                logger.error(f"Error generating handoff summary via httpx: {e}")
+                summary_for_agent = f"User requested handoff for query: '{query}'."
+
+            logger.info(f"HANDOFF signal for Chatbot: {chatbot_id} - Summary: {summary_for_agent}")
+            socketio.emit('chat_response', {
+                'answer': "I can connect you with a human agent. To do so, I'll need your name, email, and contact number. Please provide these details.",
+                'source_documents': [], 'hand_off_required': True, 'turn_off_bot': False,
+                'summary_for_agent': summary_for_agent, 'handoff_message': "Please provide user contact details for handoff.",
+                'session_id': session_id, 'timestamp': time.time()
+            }, room=sid)
+            socketio.emit('typing_indicator', {'typing': False}, room=sid)
+            return
+
+        try:
+            logger.info("Retrieving relevant documents...")
+            docs_with_scores = vectordb.similarity_search_with_score(query, k=config.get('top_k', 3))
+            sorted_docs = sorted(docs_with_scores, key=lambda x: x[1])
+            relevant_docs_for_processing = [doc for doc, score in sorted_docs]
+            
+            if not relevant_docs_for_processing:
+                logger.warning(f"No documents retrieved for query: {query}")
+                socketio.emit('chat_response', {
+                    'answer': "I don't have information about that in the provided content. Please try rephrasing your question or contact support for more details.",
+                    'source_documents': [], 'hand_off_required': False, 'turn_off_bot': False, 'session_id': session_id,
+                    'timestamp': time.time(), 'debug_info': {"error": "No documents retrieved"}
+                }, room=sid)
+                socketio.emit('typing_indicator', {'typing': False}, room=sid)
+                return
+            
+            logger.info(f"Found {len(relevant_docs_for_processing)} relevant documents")
+            context_parts = []
+            sources = []
+            
+            for i, doc in enumerate(relevant_docs_for_processing):
+                content = doc.page_content.strip()
+                content = re.sub(r'\s+', ' ', content)
+                if len(content) > 800: content = content[:800] + "..."
+                title = doc.metadata.get('title', 'Website Content')
+                url = doc.metadata.get('url', 'N/A')
+                
+                context_parts.append(f"Document {i+1} - {title}:\n{content}\n")
+                
+                sources.append({
+                    "rank": i + 1, "url": url, "title": title,
+                    "content_snippet": doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content,
+                    "relevance_score": f"High" if i < 2 else "Medium"
+                })
+
+            context = "\n".join(context_parts)
+            MAX_CONTEXT_LENGTH = 30000
+            if len(context) > MAX_CONTEXT_LENGTH:
+                context = context[:MAX_CONTEXT_LENGTH] + "\n\n[Content truncated for length]"
+            
+            # --- REFINED PROMPT ---
+            prompt = f"""You are a helpful customer service assistant for this company. Your goal is to provide accurate, precise, and comprehensive responses based on the provided "KNOWLEDGE BASE INFORMATION".
+
+IMPORTANT INSTRUCTIONS:
+- Answer the user's question directly and precisely, *only* using information explicitly found in the "KNOWLEDGE BASE INFORMATION".
+- If the question asks for a specific detail (e.g., "what is the age?"), identify the relevant entity (person, company, etc.) and extract *only* that precise detail's value from the knowledge base. For example, if asked "what is the age?", respond "29", NOT "Age: 29".
+- If the user asks a general question about an entity (e.g., "Tell me about John Doe" or "What details do you have for this applicant?"), enumerate *all* available relevant details about that entity from the knowledge base in a clear, 'Column Name: Value' format (e.g., "Applicant Name: John Doe", "Mobile: 1234567890"). Do NOT include "Field Name:", "Value:", or similar prefixes.
+- If the requested information, including any numerical identifier or general detail, is *not* explicitly present or cannot be directly extracted from the provided "KNOWLEDGE BASE INFORMATION", you MUST state clearly and concisely: "The information is not available in the provided context." Do NOT guess, invent, or infer information.
+- Do NOT use Markdown formatting (like bold, italics, bullet points, or numbered lists) in your final response. Provide plain text answers only, ensuring directness and clarity.
+- Maintain a professional and polite tone.
+- Do not make assumptions or add any external information.
+
+KNOWLEDGE BASE INFORMATION:
+{context}
+
+USER QUESTION: {query}
+
+RESPONSE (provide a clear, precise, and comprehensive answer based ONLY on the KNOWLEDGE BASE INFORMATION above):"""
+
+            logger.info("Calling LLM for response generation via httpx...")
+            
+            full_ai_answer = ""
+            LLM_GENERATION_TIMEOUT_SECONDS = 120 # A generous timeout for the entire HTTP request
+
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        f"{lm_studio_api_base_url}/chat/completions",
+                        json={
+                            "model": lm_studio_model_name,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "temperature": llm_temperature,
+                            "max_tokens": llm_max_tokens,
+                            "stream": False # Explicitly set to false for non-streaming
+                        },
+                        timeout=LLM_GENERATION_TIMEOUT_SECONDS
+                    )
+                    response.raise_for_status() # Raise an exception for HTTP errors (4xx or 5xx)
+                    response_data = response.json()
+                    full_ai_answer = response_data['choices'][0]['message']['content'].strip()
+
+            except httpx.TimeoutException as e:
+                logger.error(f"LLM response generation via httpx timed out after {LLM_GENERATION_TIMEOUT_SECONDS} seconds for chatbot {chatbot_id}: {e}")
+                socketio.emit('chat_response', {
+                    'answer': "I'm processing your request, but it's taking longer than expected. The AI model timed out. Please try a simpler question or contact support.",
+                    'source_documents': [], 'hand_off_required': False, 'turn_off_bot': False, 'session_id': session_id,
+                    'timestamp': time.time(), 'error': "LLM timeout", 'timeout_duration': f"{LLM_GENERATION_TIMEOUT_SECONDS}s"
+                }, room=sid)
+                socketio.emit('typing_indicator', {'typing': False}, room=sid)
+                return 
+            except httpx.RequestError as e:
+                logger.error(f"Network or request error during LLM invocation for chatbot {chatbot_id}: {e}", exc_info=True)
+                socketio.emit('chat_response', {
+                    'answer': "I'm experiencing network difficulties communicating with the AI model. Please try again in a moment.",
+                    'source_documents': [], 'hand_off_required': False, 'turn_off_bot': False, 'session_id': session_id,
+                    'timestamp': time.time(), 'error': str(e), 'error_type': type(e).__name__
+                }, room=sid)
+                socketio.emit('typing_indicator', {'typing': False}, room=sid)
+                return
+            except (KeyError, IndexError) as e:
+                logger.error(f"Unexpected response format from LM Studio for chatbot {chatbot_id}: {e}. Response: {response_data}", exc_info=True)
+                socketio.emit('chat_response', {
+                    'answer': "I received an unexpected response from the AI model. Please try again or contact support.",
+                    'source_documents': [], 'hand_off_required': False, 'turn_off_bot': False, 'session_id': session_id,
+                    'timestamp': time.time(), 'error': "LLM response format error", 'error_details': str(e)
+                }, room=sid)
+                socketio.emit('typing_indicator', {'typing': False}, room=sid)
+                return
+            except Exception as e:
+                logger.error(f"General error during LLM invocation via httpx for chatbot {chatbot_id}: {e}", exc_info=True)
+                socketio.emit('chat_response', {
+                    'answer': "An unexpected error occurred while processing your request with the AI model. Please try again.",
+                    'source_documents': [], 'hand_off_required': False, 'turn_off_bot': False, 'session_id': session_id,
+                    'timestamp': time.time(), 'error': str(e), 'error_type': type(e).__name__
+                }, room=sid)
+                socketio.emit('typing_indicator', {'typing': False}, room=sid)
+                return
+
+            logger.info(f"Successfully generated full response of length {len(full_ai_answer)}")
+            
+            response_time = time.time() - start_time
+            
+            # await asyncio.to_thread(log_query, f"{chatbot_id}_{uuid.uuid4()}", chatbot_id, query, full_ai_answer, len(relevant_docs_for_processing), response_time)
+            
+            socketio.emit('chat_response', {
+                'answer': full_ai_answer,
+                'source_documents': sources,
+                'hand_off_required': False,
+                'turn_off_bot': False,
+                'session_id': session_id,
+                'timestamp': time.time(),
+                'debug_info': {
+                    "retrieved_doc_count": len(relevant_docs_for_processing),
+                    "context_length": len(context),
+                    "model_used": lm_studio_model_name, # Use lm_studio_model_name here
+                    "response_length": len(full_ai_answer)
+                }
+            }, room=sid)
+
+            socketio.emit('typing_indicator', {'typing': False}, room=sid)
+            
+        except asyncio.TimeoutError: # This catch is for other async operations that might timeout (not httpx specific)
+            logger.error("A general async operation timed out within chat processing.")
+            socketio.emit('chat_response', {
+                'answer': "A part of the process timed out unexpectedly. Please try again.",
+                'source_documents': [], 'hand_off_required': False, 'turn_off_bot': False, 'session_id': session_id,
+                'timestamp': time.time(), 'error': "General process timeout"
+            }, room=sid)
+            socketio.emit('typing_indicator', {'typing': False}, room=sid)
+            return
+        except Exception as e:
+            logger.error(f"Error during chat processing for chatbot {chatbot_id}: {e}", exc_info=True)
+            socketio.emit('chat_response', {
+                'answer': "I'm experiencing technical difficulties right now. Please try again in a moment or contact support if the issue persists.",
+                'source_documents': [], 'hand_off_required': False, 'turn_off_bot': False, 'session_id': session_id,
+                'timestamp': time.time(), 'error': str(e), 'error_type': type(e).__name__
+            }, room=sid)
+            socketio.emit('typing_indicator', {'typing': False}, room=sid)
+            return
+
+    except ValidationError as e:
+        error_message = f"Validation Error: {e.errors()}"
+        logger.error(error_message, exc_info=True)
+        socketio.emit('chat_response', {
+            'answer': f"Invalid message format: {error_message}", 'source_documents': [], 'hand_off_required': False,
+            'turn_off_bot': False, 'session_id': session_id, 'timestamp': time.time(), 'error': "Validation error"
+        }, room=sid)
+        socketio.emit('typing_indicator', {'typing': False}, room=sid)
+    except Exception as e:
+        error_message = f"Unexpected error during chat processing: {e}"
+        logger.error(error_message, exc_info=True)
+        socketio.emit('chat_response', {
+            'answer': f"An unexpected error occurred during chat processing: {error_message}", 'source_documents': [],
+            'hand_off_required': False, 'turn_off_bot': False, 'session_id': session_id,
+            'timestamp': time.time(), 'error': "Server error"
+        }, room=sid)
+        socketio.emit('typing_indicator', {'typing': False}, room=sid)
+        
+
+
+# NEW SYNCHRONOUS WRAPPER FOR ASYNC BACKGROUND TASK
+# Add this function before your socketio.on('send_message') handler
+def _process_chat_message_sync_wrapper(message_data, sid):
+    """
+    Synchronous wrapper to run the _process_chat_message_async coroutine.
+    This helps ensure the async function is properly driven by an asyncio event loop
+    within the Eventlet greenlet.
+    """
+
+    try:
+        # Run the async coroutine within its own asyncio event loop
+        asyncio.run(_process_chat_message_async(message_data, sid))
+    except Exception as e:
+        # Log any errors that occur within the background task execution
+        logger.error(f"Error in _process_chat_message_sync_wrapper for SID {sid}: {e}", exc_info=True)
+        # Optionally, emit an error to the client if the task fails at this top level
+        socketio.emit('error_message', {'message': 'An unhandled error occurred in the chat processing background task.'}, room=sid)
+
+
+# Your existing socketio.on('send_message') handler
+@socketio.on('send_message')
+def handle_send_message(message_data):
+    """
+    Synchronous SocketIO handler that dispatches to a synchronous background task wrapper,
+    which then executes the async processing.
+    """
+    session_id = message_data.get('session_id')
+    if session_id:
+        update_session_activity(session_id)
+        if session_id in active_sessions:
+            active_sessions[session_id]['message_count'] += 1
+
+    print(f"DEBUG: handle_send_message function entered. SID: {request.sid}. Received data: {message_data}")
+    # Start the synchronous wrapper in a background task
+    socketio.start_background_task(_process_chat_message_sync_wrapper, message_data, request.sid)
+
+def handle_handoff_request(query, retrieved_content, docs, chatbot_id, session_id):
+    """Handle handoff request generation"""
+    try:
+        # Generate summary for handoff
+        summary_prompt = f"Summarize this conversation for a human agent handoff:\nUser Query: {query}\nContext: {retrieved_content[:500]}..."
+        summary_messages = [
+            {"role": "system", "content": "You are a helpful assistant that creates concise summaries for human agent handoffs."},
+            {"role": "user", "content": summary_prompt}
+        ]
+        
+        summary = llm_model.invoke(summary_messages).content if llm_model else f"User requested human assistance. Last query: {query}"
+        
+        handoff_response = "I understand you'd like to speak with a human agent. Let me connect you with someone who can provide more personalized assistance."
+        
+        socketio.emit('chat_response', {
+            'answer': handoff_response,
+            'source_documents': [doc.metadata for doc in docs],
+            'hand_off_required': True,
+            'summary_for_agent': summary,
+            'turn_off_bot': False,
+            'session_id': session_id,
+            'timestamp': time.time()
+        }, room=request.sid)
+        socketio.emit('typing_indicator', {'typing': False}, room=request.sid)
+        
+    except Exception as e:
+        logger.error(f"Error handling handoff request: {e}")
+        emit_error_and_cleanup("Failed to process handoff request", "Handoff error")
+
+def emit_error_and_cleanup(user_message, error_type):
+    """Helper function to emit errors and clean up typing indicators"""
+    try:
+        socketio.emit('chat_error', {
+            'error': user_message,
+            'error_type': error_type,
+            'timestamp': time.time()
+        }, room=request.sid)
+        socketio.emit('typing_indicator', {'typing': False}, room=request.sid)
+    except Exception as e:
+        logger.warning(f"Client {request.sid} disconnected before error message could be sent: {e}")
+
+# Enhanced Room Management
+@socketio.on('join_chatbot_room')
+def handle_join_chatbot_room(data):
+    """Enhanced chatbot room joining with session management"""
+    try:
+        chatbot_id = data.get('chatbot_id')
+        owner_user_id = data.get('owner_user_id')
+        session_id = data.get('session_id')
+        
+        if not all([chatbot_id, owner_user_id]):
+            emit('join_error', {'error': 'Missing required parameters'})
+            return
+        
+        room_name = f"chatbot_{chatbot_id}_{owner_user_id}"
+        join_room(room_name)
+        
+        # Create or update session
+        if not session_id or session_id not in active_sessions:
+            session_data = create_session(chatbot_id, owner_user_id, request.sid)
+            session_id = session_data['session_id']
+        else:
+            update_session_activity(session_id)
+        
+        logger.info(f"Client {request.sid} joined room {room_name} with session {session_id}")
+        
+        emit('room_joined', {
+            'room': room_name, 
+            'session_id': session_id,
+            'timestamp': time.time()
+        })
+        
+    except Exception as e:
+        logger.error(f"Error joining chatbot room: {e}", exc_info=True)
+        emit('join_error', {'error': 'Failed to join room'})
+
+@socketio.on('leave_chatbot_room')
+def handle_leave_chatbot_room(data):
+    """Enhanced room leaving with proper cleanup"""
+    try:
+        session_id = data.get('session_id')
+        chatbot_id = data.get('chatbot_id')
+        
+        logger.info(f"Client {request.sid} leaving chatbot room with session {session_id}")
+        
+        # Clean up session data
+        if session_id:
+            end_session(session_id)
+        
+        # Leave the room
+        if chatbot_id:
+            room_name = f"chatbot_{chatbot_id}"
+            leave_room(room_name)
+        
+        emit('room_left', {'session_id': session_id})
+        
+    except Exception as e:
+        logger.error(f"Error leaving chatbot room: {e}", exc_info=True)
+
+@socketio.on('request_handoff')
+def handle_request_handoff(data):
+    """Enhanced handoff request handling with better validation and tracking"""
+    conn = None # Initialize conn and cursor to None
+    cursor = None
+    try:
+        # Validate required fields
+        required_fields = ['chatbot_id', 'user_email', 'session_id'] # Ensure session_id is also required for DB
+        if not all(field in data and data[field] for field in required_fields):
+            emit('handoff_response', {
+                'success': False, 
+                'error': 'Missing required fields: chatbot_id, user_email, and session_id'
+            })
+            return
+        
+        chatbot_id = data.get('chatbot_id')
+        user_id = data.get('user_id')
+        user_name = data.get('user_name', '')
+        user_email = data.get('user_email')
+        user_phone = data.get('user_phone', '')
+        query_history = data.get('query_history', [])
+        summary = data.get('summary', '')
+        session_id = data.get('session_id')
+        
+        # Create handoff request
+        handoff_id = str(uuid.uuid4())
+        created_at_dt = datetime.now() # Keep as datetime object for internal use and DB saving
+        
+        handoff_data = {
+            'id': handoff_id, # Changed from handoff_id to id to match schema
+            'chatbot_id': chatbot_id,
+            'user_id': user_id,
+            'user_name': user_name,
+            'user_email': user_email,
+            'user_phone': user_phone,
+            'query_history': query_history,
+            'summary': summary,
+            'session_id': session_id,
+            'client_sid': request.sid,
+            'status': 'pending',
+            'created_at': created_at_dt, 
+            'priority': 'normal'
+        }
+        
+        # Store handoff request in memory (for immediate access if needed, though DB is primary)
+        handoff_requests[handoff_id] = handoff_data
+        
+        # --- Implement actual database save logic here ---
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        insert_query = """
+        INSERT INTO handoff_requests (
+            id, chatbot_id, user_id, user_name, user_email, user_phone, query_history, summary, status, created_at, session_id
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        cursor.execute(insert_query, (
+            handoff_data['id'],
+            handoff_data['chatbot_id'],
+            handoff_data['user_id'],
+            handoff_data['user_name'],
+            handoff_data['user_email'],
+            handoff_data['user_phone'],
+            json.dumps(handoff_data['query_history']), # Convert history list to JSON string for DB
+            handoff_data['summary'],
+            handoff_data['status'],
+            handoff_data['created_at'].isoformat(), # Convert datetime to string for DB
+            handoff_data['session_id']
+        ))
+        conn.commit()
+        logger.info(f"Handoff request {handoff_id} saved to database.")
+
+        # --- End database save logic ---
+
+        logger.info(f"Handoff request created: {handoff_id} for {user_email} (chatbot: {chatbot_id})")
+        
+        # Prepare data for SocketIO emission, converting datetime objects
+        # Create a copy to avoid modifying the original handoff_data that's saved in memory
+        handoff_data_for_emit = handoff_data.copy()
+        handoff_data_for_emit['created_at'] = handoff_data_for_emit['created_at'].isoformat()
+        # No 'resolved_at' at this stage, but if you add it, convert it here too.
+        
+        # Notify admins in admin room
+        socketio.emit('new_handoff_request', handoff_data_for_emit, room='admins')
+        
+        emit('handoff_response', {
+            'success': True,
+            'handoff_id': handoff_id,
+            'message': 'Your request has been submitted successfully'
+        })
+        
+    except MySQL_Error as e:
+        logger.error(f"MySQL Error in handle_request_handoff: {e}", exc_info=True)
+        emit('handoff_response', {
+            'success': False, 
+            'error': f'Failed to save handoff request to database: {str(e.msg)}'
+        })
+    except Exception as e:
+        logger.error(f"Error handling handoff request: {e}", exc_info=True)
+        emit('handoff_response', {
+            'success': False, 
+            'error': f'Failed to process handoff request: {str(e)}'
+        })
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+
+# Connection Management
+@socketio.on('connect')
+def handle_connect():
+    """Enhanced connection handler with better logging"""
+    client_info = {
+        'sid': request.sid,
+        'remote_addr': request.remote_addr,
+        'user_agent': request.headers.get('User-Agent', 'Unknown'),
+        'timestamp': datetime.now()
+    }
+    
+    logger.info(f"Client connected: {client_info}")
+    
+    # Send connection confirmation
+    emit('connection_confirmed', {
+        'sid': request.sid,
+        'server_time': time.time(),
+        'status': 'connected'
+    })
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """Enhanced disconnect handler with cleanup"""
+    logger.info(f"Client disconnected: {request.sid}")
+    
+    # Clean up any sessions associated with this client
+    sessions_to_cleanup = [
+        session_id for session_id, session_data in active_sessions.items()
+        if session_data.get('client_sid') == request.sid
+    ]
+    
+    for session_id in sessions_to_cleanup:
+        end_session(session_id)
+        logger.info(f"Cleaned up session {session_id} for disconnected client {request.sid}")
+
+# --- Admin Endpoints ---
+
+@app.route("/admin/handoffs", methods=["GET"], endpoint='admin_handoffs_get_all') # Added explicit endpoint name
+@api_key_required 
+def admin_get_all_handoff_requests(): 
+    """
+    Retrieves all human handoff requests from the database.
+    Authenticated by API key.
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True) 
+        
+        select_query = """
+        SELECT id, chatbot_id, user_id, user_name, user_email, user_phone, 
+               query_history, summary, status, created_at, resolved_at, agent_notes
+        FROM handoff_requests
+        ORDER BY created_at DESC
+        """
+        cursor.execute(select_query)
+        handoff_list = cursor.fetchall()
+
+        for handoff in handoff_list:
+            if handoff.get('query_history'):
+                try:
+                    handoff['query_history'] = json.loads(handoff['query_history'])
+                except json.JSONDecodeError:
+                    handoff['query_history'] = [] 
+            else:
+                handoff['query_history'] = []
+
+            if isinstance(handoff.get('created_at'), datetime):
+                handoff['created_at'] = handoff['created_at'].isoformat()
+            
+            if isinstance(handoff.get('resolved_at'), datetime):
+                handoff['resolved_at'] = handoff['resolved_at'].isoformat()
+            elif handoff.get('resolved_at') is None:
+                handoff['resolved_at'] = None 
+
+        logger.info(f"Retrieved {len(handoff_list)} handoff requests for admin.")
+        return jsonify(handoff_list), 200
+
+    except MySQL_Error as e:
+        logger.error(f"MySQL Error in admin_get_all_handoff_requests: {e}", exc_info=True)
+        return jsonify({"detail": f"Database error: {e.msg}"}), 500
+    except Exception as e:
+        logger.error(f"Unexpected error in admin_get_all_handoff_requests: {e}", exc_info=True)
+        return jsonify({"detail": f"An internal server error occurred: {str(e)}"}), 500
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+
+@app.route("/admin/handoffs/<string:handoff_id>/resolve", methods=["POST"], endpoint='admin_handoffs_resolve') # Added explicit endpoint name
+@api_key_required 
+def admin_resolve_handoff_request(handoff_id: str): 
+    """
+    Marks a specific human handoff request as resolved in the database.
+    Authenticated by API key.
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        update_query = """
+        UPDATE handoff_requests
+        SET status = 'resolved', resolved_at = %s
+        WHERE id = %s
+        """
+        resolved_at_timestamp = datetime.now().isoformat()
+        cursor.execute(update_query, (resolved_at_timestamp, handoff_id))
+        conn.commit()
+
+        if cursor.rowcount == 0:
+            logger.warning(f"Handoff request {handoff_id} not found for resolution.")
+            return jsonify({"detail": "Handoff request not found or already resolved."}), 404
+        
+        logger.info(f"Handoff request {handoff_id} marked as resolved by admin.")
+        return jsonify({"message": "Handoff request marked as resolved successfully."}), 200
+
+    except MySQL_Error as e:
+        logger.error(f"MySQL Error in admin_resolve_handoff_request for {handoff_id}: {e}", exc_info=True)
+        return jsonify({"detail": f"Database error: {e.msg}"}), 500
+    except Exception as e:
+        logger.error(f"Unexpected error in admin_resolve_handoff_request for {handoff_id}: {e}", exc_info=True)
+        return jsonify({"detail": f"An internal server error occurred: {str(e)}"}), 500
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+
+# Admin Room Management
+@socketio.on('join_admin_room')
+def handle_join_admin_room(data):
+    """Handle admin joining admin room for notifications"""
+    try:
+        # TODO: Add proper admin authentication here
+        admin_token = data.get('admin_token')
+        if not admin_token:  # or not validate_admin_token(admin_token):
+            emit('admin_join_error', {'error': 'Invalid admin credentials'})
+            return
+        
+        join_room('admins')
+        logger.info(f"Admin client {request.sid} joined admin room")
+        
+        # Send current pending handoffs
+        pending_handoffs = [
+            handoff for handoff in handoff_requests.values()
+            if handoff['status'] == 'pending'
+        ]
+        
+        emit('admin_room_joined', {
+            'message': 'Successfully joined admin room',
+            'pending_handoffs': pending_handoffs
+        })
+        
+    except Exception as e:
+        logger.error(f"Error joining admin room: {e}", exc_info=True)
+        emit('admin_join_error', {'error': 'Failed to join admin room'})
+
+# Health Check
+@socketio.on('health_check')
+def handle_health_check():
+    """Health check endpoint for monitoring"""
+    try:
+        health_data = {
+            'status': 'healthy',
+            'timestamp': time.time(),
+            'active_sessions': len(active_sessions),
+            'pending_handoffs': len([h for h in handoff_requests.values() if h['status'] == 'pending']),
+            'llm_loaded': llm_model is not None,
+            'embeddings_loaded': embeddings is not None
+        }
+        
+        emit('health_check_response', health_data)
+        
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        emit('health_check_response', {'status': 'unhealthy', 'error': str(e)})
+
+# Utility function for periodic cleanup (call this periodically)
+def cleanup_inactive_sessions(max_inactive_minutes=30):
+    """Clean up inactive sessions"""
+    cutoff_time = datetime.now() - timedelta(minutes=max_inactive_minutes)
+    sessions_to_remove = []
+    
+    for session_id, session_data in active_sessions.items():
+        if session_data['last_activity'] < cutoff_time:
+            sessions_to_remove.append(session_id)
+    
+    for session_id in sessions_to_remove:
+        end_session(session_id)
+        logger.info(f"Cleaned up inactive session: {session_id}")
+    
+    return len(sessions_to_remove)
+
+
+# --- SQLite Accuracy Tracking Functions (for local logging, not main app data) ---
+def init_accuracy_db():
+    conn = sqlite3.connect('bot_accuracy.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS chat_feedback ( id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, client_id TEXT, query TEXT, bot_response TEXT, user_rating INTEGER, feedback_text TEXT, expected_answer TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS query_logs ( id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, client_id TEXT, query TEXT, bot_response TEXT, retrieved_docs_count INTEGER, response_time REAL, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP )
+    ''')
+    conn.commit()
+    conn.close()
+
+def log_query(chat_id: str, client_id: str, query: str, response: str, doc_count: int, response_time: float):
+    try:
+        conn = sqlite3.connect('bot_accuracy.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO query_logs (chat_id, client_id, query, bot_response, retrieved_docs_count, response_time)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (chat_id, client_id, query, response, doc_count, response_time))
+        conn.commit()
+        conn.close()
+    except Exception as e: logger.error(f"Error logging query: {e}")
+
+
+if __name__ == '__main__':
+    # For local development, set these environment variables directly or via a .env file loader
+    os.environ['MYSQL_HOST'] = 'localhost'
+    os.environ['MYSQL_DATABASE'] = 'chatbot_saas'
+    os.environ['MYSQL_USER'] = 'root'
+    os.environ['MYSQL_PASSWORD'] = '' # Set your MySQL password here for local testing
+
+    os.environ['FLASK_API_KEY'] = 'your_super_secret_flask_api_key' # Use a strong key for prod!
+
+    os.environ['LM_STUDIO_BASE_URL'] = os.environ.get('LM_STUDIO_BASE_URL', 'http://192.168.234.1:1234/v1')
+    os.environ['LM_STUDIO_MODEL_NAME'] = os.environ.get('LM_STUDIO_MODEL_NAME', 'gemm3:4b')
+    startup_event()
+    
+    socketio.run(app, debug=True, host='0.0.0.0', port=5000)

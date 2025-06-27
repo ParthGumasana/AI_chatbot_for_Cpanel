@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 # where X.Y is your Python version (e.g., 3.9)
 
 # Import your Flask app instance. It MUST be named 'application' for Passenger.
-from app import app as application
+from backend.app import app as application
 
 # Set environment variables for MySQL and Flask API Key if not set globally on cPanel
 # For local testing, these are typically handled in `if __name__ == '__main__':` block in app.py
