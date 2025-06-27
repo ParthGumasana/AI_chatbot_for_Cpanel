@@ -3,3 +3,4 @@
 /venv
 /templates/__pycache__
 /templates/backup_code
+app.py
