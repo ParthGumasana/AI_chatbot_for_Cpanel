@@ -26,7 +26,7 @@ This repository contains the full codebase for a SaaS AI Chatbot application, al
 
 ## Project Structure
 
-
+```text
 your_saas_chatbot_local/
 ├── backend/
 │   ├── app.py                     # Flask application (main backend logic)
@@ -39,8 +39,8 @@ your_saas_chatbot_local/
 │   ├── .env                       # Laravel environment variables
 │   ├── composer.json              # Laravel project dependencies (boilerplate)
 │   ├── public/                    # Laravel's web root, includes embed widget
-│   │   └── index.php              # Laravel entry point (boilerplate)
-│   │   └── chatbot_embed_widget.html # The embeddable chatbot widget
+│   │   ├── index.php              # Laravel entry point (boilerplate)
+│   │   └── chatbot_embed_widget.html  # The embeddable chatbot widget
 │   ├── app/
 │   │   └── Http/
 │   │       └── Controllers/
@@ -67,6 +67,7 @@ your_saas_chatbot_local/
 │   ├── vite.config.js             # Vite configuration for frontend assets (boilerplate)
 │   └── (other Laravel boilerplate files like config/, database/, etc.)
 └── README.md                      # Overall project setup and deployment guide
+```
 
 
 ## Local Setup Instructions
